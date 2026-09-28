@@ -1,6 +1,6 @@
 # workbenches
 
-Instant, independent copies of a git repo. Each copy is on its own branch, has its own ports, and can run its own dev server, all at the same time.
+`wb` makes full copies of a git repo, each on its own branch with its own block of ports, so you (or several AI agents) can work on and run a few versions of the same app at once.
 
 ```
 ~/code/myapp                        main          :3000
@@ -8,80 +8,70 @@ Instant, independent copies of a git repo. Each copy is on its own branch, has i
 ~/.workbenches/myapp/new-dashboard  new-dashboard :3110
 ```
 
-It isn't a git worktree. Each workbench is a full copy of your folder with its own `.git`, so:
+## Why not `git worktree`
 
-- any branch can be checked out anywhere, even the same one in several places
-- `.env`, `node_modules`, build caches and uncommitted work all come along
-- deleting one is deleting a folder, with nothing left behind in your repo
+A worktree shares one `.git` with the original. That's why git won't check out the same branch twice, and why `.env`, `node_modules` and build caches don't come along: you reinstall and reconfigure every time.
 
-On APFS (macOS), btrfs/XFS (Linux) and ReFS/Dev Drive (Windows), copies are copy-on-write: a 10 GB repo copies in a couple of seconds and uses almost no disk until files change.
+A workbench is a copy of the whole folder, `.git` included. Any branch can be checked out in any copy, everything untracked comes along, and deleting one is deleting a folder. On filesystems with copy-on-write clones (APFS, btrfs, XFS) the copy shares disk with the original until files change.
 
 ## Install
 
 ```
-cargo install --path .
+cargo install --git https://github.com/EduardoFazolo/workbenches
 ```
 
 ## Use
 
 ```
-wb new login-fix                    # copy this repo, branch login-fix, ports 3100-3109
-wb run login-fix -- npm run dev     # run anything inside it, with PORT set
-wb run login-fix -- sh -c 'vite --port $PORT'   # sh -c to use $PORT in args
-wb shell login-fix                  # or open a shell in it
-cd "$(wb path login-fix)"           # or just go there
-
-wb ls                               # what exists, what's running, what changed
-wb land login-fix                   # bring its branch back into the original repo
-wb rm login-fix                     # stop its processes, delete it
+wb new login-fix                  # copy this repo: branch login-fix, ports 3100-3109
+wb run login-fix -- npm run dev   # run a command inside it with PORT=3100
+cd "$(wb path login-fix)"         # or work in it directly (wb shell login-fix opens a shell)
+wb ls                             # every copy: branch, port, what's running, changes
+wb land login-fix                 # fetch its branch into the original repo
+wb rm login-fix                   # stop what runs inside it and delete it
 ```
 
-`wb --help` is the full guide and `wb <command> --help` explains each command. `wb --agents` prints a complete usage guide for AI agents, as a skill file:
+`--branch <b>` checks out an existing branch instead of creating one, including a branch that only exists on a remote. `--from <path>` copies a repo you're not in.
+
+`wb run` runs the command as given, not through a shell, so `$PORT` in its arguments would be expanded by your own shell first. Wrap those in `sh -c` with single quotes:
+
+```
+wb run login-fix -- sh -c 'vite --port $PORT --strictPort'
+```
+
+For AI coding agents, `wb --agents` prints a usage guide in skill format:
 
 ```
 mkdir -p ~/.claude/skills/workbenches && wb --agents > ~/.claude/skills/workbenches/SKILL.md
 ```
 
-`wb new x --branch some-existing-branch` checks out an existing branch instead of making one. A branch that only exists on a remote is checked out tracking it, like `git switch` does (origin wins when several remotes have it).
+## Environment
 
-`wb rm` refuses when the workbench would lose work: uncommitted changes (untracked files included), or commits the original can't reach and no remote has, whether on a branch, a tag, in the stash or only in the reflog. Submodules are checked too, and if git can't answer, it refuses rather than guess. Land or push first, or use `--force`. It stops the processes running inside the copy but leaves shells alone, so a terminal tab `cd`'d into it stays open.
+`wb run`, `wb shell` and `.wb/setup` get these variables (`wb env <name>` prints them):
+
+| Variable | Example | |
+|---|---|---|
+| `PORT`, `WB_PORT` | `3100` | First port of the copy's block of 10 |
+| `WB_PORTS` | `3100-3109` | The whole block, for extra services |
+| `COMPOSE_PROJECT_NAME` | `myapp-login-fix` | Keeps docker compose containers and volumes apart |
+| `WB_NAME`, `WB_PROJECT` | `login-fix`, `myapp` | |
+| `WB_PATH`, `WB_SOURCE` | | The copy, and the original |
+
+`COMPOSE_PROJECT_NAME` is `<project>-<name>` when that's already a valid compose name. Otherwise it's cleaned up to one and gets a short hash, so `fix.a` and `fix-a` stay apart.
+
+Settings: `WB_HOME` moves the copies (default `~/.workbenches`; keep it on the same disk as your repos, clones don't cross disks). `WB_COPY=1` is the same as `--copy`.
 
 ## What `wb new` does
 
-1. **Checks the source.** It refuses a linked worktree or submodule (the copy would share its branch with the original), and a repo that's mid-merge, mid-rebase or has a running git command.
-2. **Copies the folder**, in one `clonefile` call on macOS, or reflinking each file elsewhere.
-3. **Makes the copied `.git` independent.**
-   - Drops the original's worktree list.
-   - Removes stale lock, pid and socket files.
-   - Fixes relative remotes and alternates.
-   - Keeps your git identity, even if it came from an `includeIf "gitdir:..."`.
-   - Refreshes the index so the first `git status` is instant.
-   - Switches to the branch.
-4. **Rewrites leftover paths.** Untracked text files that still contain the original folder's path get the copy's path instead. This fixes Python venv scripts (otherwise `pip` installs into the original's venv), pnpm shims, Bundler config, editable installs, git hooks and absolute symlinks, without knowing any of those tools.
-   - Committed files are never modified, only reported. That includes committed symlinks and files in submodules or nested repos. If git can't list a repo's committed files (a broken vendored `.git`, say), nothing in that repo is rewritten, and `wb` says so.
-   - Binary files are never touched.
-5. **Removes pid and lock files** left by processes running in the original, so the copy's dev server doesn't think it's already running.
-6. **Runs `.wb/setup`** if your repo has one (see below).
+1. **Refuses unsafe sources.** A linked worktree or submodule (the copy would share state with the original), a repo in the middle of a merge, rebase, cherry-pick or bisect, or one with a git command running.
+2. **Copies the folder.** One `clonefile` call on macOS, a reflink per file on Linux. On a disk without clones it refuses rather than silently using gigabytes; `--copy` does a real copy.
+3. **Makes the copied `.git` independent.** Drops the original's worktree list and stale lock files, fixes relative remotes and alternates, keeps your git identity (including one set by `includeIf "gitdir:..."`), and switches to the branch.
+4. **Rewrites leftover paths.** Untracked text files that contain the original folder's path get the copy's path instead: Python venv scripts (otherwise `pip` installs into the original's venv), pnpm shims, git hooks, absolute symlinks. Committed files are never changed, only listed, including committed symlinks and files in submodules. Binary files are skipped. Pid and lock files left by processes running in the original are removed.
+5. **Runs `.wb/setup`** if the repo has one.
 
-## Environment
+## `.wb/setup`
 
-`wb run`, `wb shell` and `.wb/setup` get these (print them with `wb env <name>`):
-
-| var | example | |
-|---|---|---|
-| `PORT`, `WB_PORT` | `3100` | first port of this workbench's block |
-| `WB_PORTS` | `3100-3109` | the whole block, for monorepos with several apps |
-| `COMPOSE_PROJECT_NAME` | `myapp-login-fix` | keeps docker compose containers and volumes apart |
-| `WB_NAME`, `WB_PROJECT` | `login-fix`, `myapp` | |
-| `WB_PATH`, `WB_SOURCE` | | this copy, and the original folder |
-
-`wb run` runs the command as given, never through a shell. Frameworks that read `PORT` (Next.js, Rails, Express...) just work. Ones that don't (Vite) need the port as an argument: `wb run x -- sh -c 'vite --port $PORT --strictPort'`. Use single quotes, or your own shell expands `$PORT` before `wb` sees it.
-
-`COMPOSE_PROJECT_NAME` is `<project>-<name>` when that's already a valid Compose name (lowercase letters, digits, `-`, `_`). Otherwise it's cleaned up to one and a short hash of the real name is appended, so `fix.a`, `fix-a` and `Fix-a` never share containers.
-
-## `.wb/setup` (optional)
-
-An executable `.wb/setup` in your repo runs inside every new workbench with the env above. On Windows it's `setup.cmd`, `setup.bat` or `setup.ps1`. If it fails, `wb new` still succeeds and keeps the workbench, and tells you how to re-run the hook. Use it for what can't be generic, like a separate database:
+An executable `.wb/setup` runs inside every new copy with the variables above. Use it for what a copy can't give you, like a separate database:
 
 ```sh
 #!/bin/sh
@@ -89,26 +79,38 @@ createdb -T myapp_dev "myapp_$WB_NAME"
 echo "DATABASE_URL=postgres://localhost/myapp_$WB_NAME" >> .env.local
 ```
 
-## Several repos in one folder
+If it fails, the copy is kept and `wb new` tells you how to re-run it. `--no-setup` skips it.
 
-Run `wb new x` from a folder that isn't a repo itself but holds several (e.g. `frontend/` and `backend/`). The whole folder gets copied and every repo in it gets branch `x`.
+## `wb rm` doesn't lose work
 
-## Where things live
+It refuses when deleting would lose:
 
-Copies go to `~/.workbenches/<project>/<name>`, and `WB_HOME` changes that. Nothing is written into your repo.
+- uncommitted changes, untracked files included
+- commits the original can't reach and no remote has: on a branch or tag, in the stash, or only in the reflog after a detached HEAD or a reset
+- any of the above inside a submodule
 
-- **Same disk.** Copy-on-write only works on one disk, so keep `WB_HOME` on the same disk as your repos.
-- **Filesystems without copy-on-write** (ext4, NTFS): `wb` refuses rather than silently copying gigabytes. Pass `--copy` or set `WB_COPY=1`.
-- **Deleting is instant.** `wb rm` moves the folder to `~/.workbenches/.trash` and deletes it in the background.
-- **macOS:** `~/.workbenches` is excluded from Spotlight and Time Machine.
+If git can't answer, it refuses too. `wb land` or push, then `rm` again; `--force` deletes anyway.
 
-## Known limits
+Before deleting, it stops the processes running inside the copy. Shells are left alone, so a terminal tab that `cd`'d into it stays open. The folder is moved to `~/.workbenches/.trash` and deleted in the background, so `rm` returns at once.
 
-- Build folders that store absolute paths inside binary files will rebuild from cold in the copy (CMake, Gradle's configuration cache). Bazel and Xcode's DerivedData key their caches by folder path, so each copy starts cold.
-- Folders synced by iCloud Drive or Dropbox can have files that aren't downloaded. Keep repos outside them.
-- `wb rm` checks git's view of the copy. Ignored files (an edited `.env`, a local database file) aren't part of it and go with the folder.
-- `wb land` brings back each repo's branch, not commits made inside submodules. Push those; `wb rm` refuses until you do.
-- Tested on macOS (APFS) and Linux. Windows compiles (CI checks it) but hasn't been run yet.
+## Speed
+
+The copy itself is one fast call. Most of the time goes to step 4, which reads every small file to find leftover paths, so the time grows with the number of files, not their size. On an Apple Silicon Mac:
+
+| Repo | Copy | Git fixes | Path scan | Total |
+|---|---|---|---|---|
+| 100k files, 391 MB | 1.0s | 0.4s | 2.1s | 3.5s |
+
+A large `node_modules` (300k to 500k files) takes several seconds more.
+
+## Limits
+
+- **Windows support was written by AI and has never been run.** It compiles in CI, nothing more. Treat it as untested.
+- `wb rm` checks what git knows about. Changes to ignored files (an edited `.env`, a local database file) aren't checked and go with the folder.
+- `wb land` lands the repo's branch, not commits made inside submodules. Push those; `wb rm` refuses until you do.
+- `wb rm` tells shells apart from dev servers by process name (`sh`, `bash`, `zsh`...). A server started as a shell loop (`sh -c 'while ...'`) keeps running.
+- Caches that store absolute paths in binary files (CMake, Gradle's configuration cache) or key on the folder path (Bazel, Xcode DerivedData) start cold in each copy.
+- Files that iCloud Drive or Dropbox hasn't downloaded can't be copied. Keep repos outside synced folders.
 
 ## Tests
 
@@ -116,5 +118,8 @@ Copies go to `~/.workbenches/<project>/<name>`, and `WB_HOME` changes that. Noth
 cargo test
 ```
 
-- `tests/use_cases.rs`: one test per use case, written from this README and `wb --help` alone, black-box against the real binary. The list of use cases is at the top of the file. Each test runs in its own sandbox (temp `HOME`, `WB_HOME` and git config), so nothing touches your real setup.
-- Unit tests next to the code cover the few rules worth pinning down directly: whole-path matching when rewriting, name validation, compose names and port blocks.
+`tests/use_cases.rs` has one test per use case, run against the real binary in a sandbox (its own `HOME`, `WB_HOME` and git config). Most of them were written from this README and `wb --help` before reading the code, so they check what's promised, not what's implemented. A few unit tests next to the code cover rules easier to pin down directly: whole-path matching, name rules, compose names and port blocks.
+
+## License
+
+MIT

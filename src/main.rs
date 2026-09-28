@@ -11,55 +11,28 @@ use registry::{Bench, PORT_BLOCK};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::time::Instant;
 use util::{canonical, tilde};
 
-const LONG_ABOUT: &str = "\
-Instant, independent copies of a git repo, each on its own branch and its own ports.
-
-A workbench is a full copy of your repo folder, .git included. Not a git worktree:
-  - any branch can be checked out in any workbench, even the same one in several
-  - .env, node_modules, build caches and uncommitted work all come along
-  - deleting one is deleting a folder; nothing is ever written into your repo
-
-On APFS (macOS), btrfs/XFS (Linux) and ReFS/Dev Drive (Windows) copies are
-copy-on-write: a 10 GB repo copies in seconds and uses almost no disk until files
-change. Other filesystems need --copy (or WB_COPY=1) for a real copy.
-
-Each workbench gets a block of 10 ports (3100-3109, 3110-3119, ...). Commands run
-through `wb run` / `wb shell` see PORT, WB_PORT, WB_PORTS, COMPOSE_PROJECT_NAME,
-WB_NAME, WB_PROJECT, WB_PATH and WB_SOURCE.";
-
-const AFTER_LONG_HELP: &str = "\
-Typical flow:
-  wb new login-fix                   copy this repo, branch login-fix, ports 3100-3109
-  wb run login-fix -- npm run dev    dev server on PORT=3100, next to your main one
-  cd \"$(wb path login-fix)\"          work there (or: wb shell login-fix)
-  git commit ...                     commit inside the workbench as usual
-  wb land login-fix                  bring the branch back into the original repo
-  wb rm login-fix                    stop its processes and delete it
-
-Optional per-repo hook: an executable .wb/setup runs inside every new workbench
-with the env above (e.g. create a separate database). Windows: .wb/setup.cmd/.bat/.ps1
-
-Environment:
-  WB_HOME   where workbenches live (default ~/.workbenches; keep it on the repo's disk)
-  WB_COPY   1 = allow full copies on disks without copy-on-write
-
-For AI agents: `wb --agents` prints complete usage rules as a skill file.";
+const NAME_HELP: &str = "Workbench name (or project/name, see `wb ls --all`)";
 
 #[derive(Parser)]
 #[command(
     name = "wb",
     version,
-    about = "Instant, independent copies of a git repo, each on its own branch and ports.",
-    long_about = LONG_ABOUT,
-    after_help = "Run `wb --help` for the full guide, `wb <command> --help` for details, `wb --agents` for AI agents.",
-    after_long_help = AFTER_LONG_HELP,
-    args_conflicts_with_subcommands = true,
+    about = "Independent copies of a git repo, each on its own branch and block of ports.",
+    after_help = "\
+Typical flow:
+  wb new login-fix                   copy this repo; branch login-fix; ports 3100-3109
+  wb run login-fix -- npm run dev    run it with PORT=3100
+  wb land login-fix                  bring its commits back into this repo
+  wb rm login-fix                    stop it and delete it
+
+Environment: WB_HOME (where copies live, default ~/.workbenches), WB_COPY=1 (same as --copy).
+Details: https://github.com/EduardoFazolo/workbenches. `wb --agents` prints a guide for AI coding agents.",
+    args_conflicts_with_subcommands = true
 )]
 struct Cli {
-    /// Print the complete usage guide for AI agents (a SKILL.md you can install)
+    /// Print the usage guide for AI coding agents (a SKILL.md)
     #[arg(long)]
     agents: bool,
 
@@ -69,148 +42,84 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Copy this repo into a new workbench, on its own branch and ports
-    #[command(
-        verbatim_doc_comment,
-        after_long_help = "\
+    /// Copy the repo you're in to a new workbench on its own branch and ports
+    #[command(after_help = "\
 Examples:
-  wb new login-fix                        new branch login-fix from the current HEAD
-  wb new review --branch feature/payments check out an existing branch instead
-  wb new spike --from ~/code/other-repo   copy a repo you're not in
-  wb new both                             run from a folder holding several repos:
-                                          copies them all, each on branch 'both'"
-    )]
-    ///
-    /// Copies the git repo you're in (or --from) to ~/.workbenches/<project>/<name>,
-    /// including .env, node_modules, build folders and uncommitted changes, then:
-    ///   - makes the copied .git independent (own HEAD, index and worktree list;
-    ///     stale locks removed; relative remotes fixed; your git identity kept)
-    ///   - checks out the branch: <name> by default, created if it doesn't exist
-    ///   - rewrites leftover absolute paths to the original folder in untracked text
-    ///     files (Python venvs, pnpm shims, Bundler config, git hooks, symlinks),
-    ///     so the copy never runs or writes into the original
-    ///   - removes pid/lock files of processes running in the original
-    ///   - reserves a block of 10 ports
-    ///   - runs .wb/setup if the repo has one
-    ///
-    /// Refuses when the copy would stay tied to the original: the source is a git
-    /// worktree or submodule, or it's mid-merge/rebase/cherry-pick/bisect.
+  wb new login-fix                          new branch login-fix from HEAD
+  wb new review --branch feature/payments   check out an existing branch
+  wb new spike --from ~/code/other-repo     copy a repo you're not in")]
     New {
-        /// Workbench name: letters, digits, '-', '_', '.'
+        /// Letters, digits, '-', '_' and '.'
         name: String,
-        /// Branch to use (default: the workbench name). An existing branch, local or
-        /// only on a remote, is checked out.
+        /// Branch to check out, local or remote-only (default: the name, created from HEAD)
         #[arg(short, long)]
         branch: Option<String>,
-        /// Folder to copy (default: the git repo containing the current directory)
+        /// Repo to copy (default: the one you're in)
         #[arg(long, value_name = "PATH")]
         from: Option<PathBuf>,
-        /// Allow a full byte copy when the disk can't do copy-on-write clones
+        /// Allow a full copy on a disk without copy-on-write
         #[arg(long, env = "WB_COPY", value_parser = clap::builder::BoolishValueParser::new(), default_value_t = false)]
         copy: bool,
-        /// Don't run .wb/setup afterwards
+        /// Don't run .wb/setup
         #[arg(long)]
         no_setup: bool,
     },
 
-    /// List workbenches with branch, ports, running state and changes
-    #[command(verbatim_doc_comment)]
-    ///
-    /// Shows the workbenches of the repo you're in (all of them with --all, or when
-    /// you're not in a known repo). Columns:
-    ///   NAME     workbench name (project/name with --all)
-    ///   BRANCH   branch currently checked out in it
-    ///   PORT     first port of its block of 10
-    ///   STATUS   "serving :3100" if something listens on its ports,
-    ///            "N processes" if something runs inside it, else "idle"
-    ///   CHANGES  uncommitted files, "clean", or "?" if git couldn't tell
-    ///   AGE      time since it was created
+    /// List this repo's workbenches: branch, port, what's running, changes
     Ls {
-        /// Show workbenches of every repo
+        /// Every repo's workbenches
         #[arg(short, long)]
         all: bool,
     },
 
-    /// Delete a workbench: stop its processes, then remove the folder
-    #[command(verbatim_doc_comment)]
-    ///
-    /// Refuses if the workbench (or a submodule in it) has uncommitted changes, or
-    /// commits the original repo can't reach and no remote has: on a branch or
-    /// tag, in the stash, or left behind by a detached HEAD or reset. Land or push
-    /// them first, or pass --force to throw them away.
-    ///
-    /// Stops every process running inside the folder (not shells, so terminal
-    /// tabs cd'd into it stay open), then
-    /// moves the folder to ~/.workbenches/.trash and deletes it in the background,
-    /// so it returns instantly.
+    /// Stop what runs inside a workbench and delete it; refuses if work would be lost
     Rm {
-        /// Workbench name (or project/name, see `wb ls --all`)
+        #[arg(help = NAME_HELP)]
         name: String,
         /// Delete even if work would be lost
         #[arg(short, long)]
         force: bool,
     },
 
-    /// Print a workbench's folder path
+    /// Print a workbench's folder
     #[command(after_help = "Example:  cd \"$(wb path login-fix)\"")]
     Path {
-        /// Workbench name (or project/name, see `wb ls --all`)
+        #[arg(help = NAME_HELP)]
         name: String,
     },
 
-    /// Run a command inside a workbench, with PORT and the other WB_* vars set
-    #[command(
-        verbatim_doc_comment,
-        after_help = "\
+    /// Run a command in a workbench with PORT and the WB_* variables set
+    #[command(after_help = "\
 Examples:
   wb run login-fix -- npm run dev
-  wb run login-fix -- sh -c 'npx vite --port $PORT --strictPort'   (Vite ignores PORT)
-  wb run login-fix -- docker compose up                   (own COMPOSE_PROJECT_NAME)
-  wb run login-fix -- git log --oneline -5
+  wb run login-fix -- sh -c 'vite --port $PORT --strictPort'
 
-The command runs as given, never through a shell. To use $PORT or other WB_*
-vars in its arguments, wrap it in sh -c '...' with single quotes: your own shell
-would otherwise expand $PORT before wb sees it. (Windows runs it via cmd /C,
-which expands %PORT%.)"
-    )]
-    ///
-    /// Runs in the workbench folder and returns the command's exit code.
-    /// Env: PORT, WB_PORT, WB_PORTS, COMPOSE_PROJECT_NAME, WB_NAME, WB_PROJECT,
-    /// WB_PATH, WB_SOURCE.
+The command runs as given, not through a shell. Use sh -c '...' (single quotes)
+to put $PORT in its arguments.")]
     Run {
-        /// Workbench name (or project/name, see `wb ls --all`)
+        #[arg(help = NAME_HELP)]
         name: String,
         /// The command and its arguments
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true, value_name = "COMMAND")]
         cmd: Vec<String>,
     },
 
-    /// Open your shell inside a workbench, with its env set
+    /// Open your shell in a workbench with its variables set
     Shell {
-        /// Workbench name (or project/name, see `wb ls --all`)
+        #[arg(help = NAME_HELP)]
         name: String,
     },
 
-    /// Print a workbench's env vars as shell exports
+    /// Print a workbench's variables as shell exports
     #[command(after_help = "Example:  eval \"$(wb env login-fix)\"")]
     Env {
-        /// Workbench name (or project/name, see `wb ls --all`)
+        #[arg(help = NAME_HELP)]
         name: String,
     },
 
-    /// Bring a workbench's branch back into the original repo
-    #[command(verbatim_doc_comment)]
-    ///
-    /// Fetches the workbench's current branch into the original repo under the same
-    /// name. Only commits move; uncommitted changes stay in the workbench.
-    ///
-    /// If that branch is checked out in the original, git won't move it, so it's
-    /// fetched and you get the merge command to run there. If the original's branch
-    /// has commits the workbench lacks, it refuses: merge or rebase first.
-    ///
-    /// Alternatively just `git push` from the workbench: origin came along.
+    /// Fetch a workbench's current branch into the original repo
     Land {
-        /// Workbench name (or project/name, see `wb ls --all`)
+        #[arg(help = NAME_HELP)]
         name: String,
     },
 
@@ -268,7 +177,9 @@ fn cmd_new(name: &str, branch: Option<String>, from: Option<PathBuf>, allow_copy
         Some(p) => p,
         None => std::env::current_dir()?,
     });
-    let (root, repos) = find_repos(&from)?;
+    let root = gitfix::toplevel(&from)
+        .map(|p| canonical(&p))
+        .with_context(|| format!("{} isn't inside a git repo", from.display()))?;
 
     let home = registry::home();
     fs::create_dir_all(&home)?;
@@ -280,9 +191,7 @@ fn cmd_new(name: &str, branch: Option<String>, from: Option<PathBuf>, allow_copy
             home.display()
         );
     }
-    for r in &repos {
-        gitfix::preflight(&root.join(r))?;
-    }
+    gitfix::preflight(&root)?;
     mark_home(&home);
 
     // Project, name and ports are claimed under one lock; the copy itself isn't.
@@ -300,7 +209,6 @@ fn cmd_new(name: &str, branch: Option<String>, from: Option<PathBuf>, allow_copy
             source: root.clone(),
             path,
             branch,
-            repos,
             port: registry::allocate_port(&taken)?,
             created: util::now_secs(),
         };
@@ -322,54 +230,17 @@ fn cmd_new(name: &str, branch: Option<String>, from: Option<PathBuf>, allow_copy
     Ok(())
 }
 
-/// The git repo containing `from`, or a plain folder holding several repos.
-fn find_repos(from: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
-    if let Some(top) = gitfix::toplevel(from) {
-        return Ok((canonical(&top), vec![PathBuf::new()]));
-    }
-    let mut repos: Vec<PathBuf> = fs::read_dir(from)
-        .with_context(|| format!("reading {}", from.display()))?
-        .flatten()
-        .filter(|e| e.path().join(".git").exists())
-        .map(|e| PathBuf::from(e.file_name()))
-        .collect();
-    repos.sort();
-    if repos.is_empty() {
-        bail!("{} isn't in a git repo, and has no git repos directly inside it", from.display());
-    }
-    Ok((from.to_path_buf(), repos))
-}
-
-/// `WB_TIMING=1` prints how long each phase took.
-fn phase(label: &str, since: &mut Instant) {
-    if std::env::var_os("WB_TIMING").is_some() {
-        eprintln!("  [{label}: {:.2}s]", since.elapsed().as_secs_f64());
-    }
-    *since = Instant::now();
-}
-
 fn build(b: &Bench, allow_copy: bool) -> Result<()> {
-    let t = Instant::now();
-    let mut p = Instant::now();
+    let started = std::time::Instant::now();
     let mode = clone::clone_tree(&b.source, &b.path, allow_copy)?;
-    phase("clone", &mut p);
-
-    let mut notes = Vec::new();
-    for rel in &b.repos {
-        let (src, dst) = (b.source.join(rel), b.path.join(rel));
-        for n in gitfix::fix_clone(&src, &dst, &b.branch)? {
-            notes.push(format!("{}{n}", label(rel)));
-        }
-    }
-    phase("git fixups", &mut p);
+    let notes = gitfix::fix_clone(&b.source, &b.path, &b.branch)?;
     let stats = relocate::relocate(&b.source, &b.path)?;
-    phase("relocate", &mut p);
 
     let how = match mode {
         clone::Mode::Clone => "copy-on-write, uses almost no disk",
         clone::Mode::Copy => "full copy",
     };
-    println!("✓ {} ready in {:.1}s ({how})", b.name, t.elapsed().as_secs_f64());
+    println!("✓ {} ready in {:.1}s ({how})", b.name, started.elapsed().as_secs_f64());
     println!("    path    {}", tilde(&b.path));
     println!("    branch  {}", b.branch);
     println!("    ports   {}-{}  (PORT={})", b.port, b.port + PORT_BLOCK - 1, b.port);
@@ -413,11 +284,6 @@ fn build(b: &Bench, allow_copy: bool) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// "sub/dir: " for a repo inside the workbench, "" for the workbench itself.
-fn label(rel: &Path) -> String {
-    if rel.as_os_str().is_empty() { String::new() } else { format!("{}: ", rel.display()) }
 }
 
 /// Keep Spotlight and Time Machine from indexing/backing up N copies.
@@ -546,21 +412,14 @@ fn cmd_ls(all: bool) -> Result<()> {
         .iter()
         .map(|b| {
             let name = if cur.is_some() { b.name.clone() } else { format!("{}/{}", b.project, b.name) };
-            let first = b.path.join(&b.repos[0]);
             let branch = if !b.path.exists() {
                 "(folder missing)".into()
-            } else if b.repos.len() == 1 {
-                gitfix::out(&first, &["branch", "--show-current"])
+            } else {
+                gitfix::out(&b.path, &["branch", "--show-current"])
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "(detached)".into())
-            } else {
-                format!("{} ({} repos)", b.branch, b.repos.len())
             };
-            let changed: Option<usize> = b
-                .repos
-                .iter()
-                .map(|r| gitfix::out(&b.path.join(r), &["status", "--porcelain"]).map(|s| s.lines().count()))
-                .sum();
+            let changed = gitfix::out(&b.path, &["status", "--porcelain"]).map(|s| s.lines().count());
             let listening: Vec<u16> = (b.port..b.port + PORT_BLOCK).filter(|&p| registry::port_listening(p)).collect();
             let nprocs = procs::inside(&sys, &canonical(&b.path)).len();
             let status = if !listening.is_empty() {
@@ -617,8 +476,6 @@ fn cmd_rm(name: &str, force: bool) -> Result<()> {
         }
     }
 
-    let mut p = Instant::now();
-    phase("safety checks", &mut p);
     if b.path.exists() {
         let dir = canonical(&b.path);
         let procs::Stopped { stopped, shells } = procs::stop_inside(&dir);
@@ -628,12 +485,9 @@ fn cmd_rm(name: &str, force: bool) -> Result<()> {
         if shells > 0 {
             println!("  note: {shells} shell(s) had their working directory inside it; cd them elsewhere");
         }
-        phase("stop processes", &mut p);
-        for rel in &b.repos {
-            let dst = b.path.join(rel);
-            let _ = gitfix::git(&dst).args(["fsmonitor--daemon", "stop"]).output();
-            let _ = gitfix::git(&dst).args(["maintenance", "unregister", "--force"]).output();
-        }
+        // Best effort: background git helpers that would outlive the folder.
+        let _ = gitfix::git(&b.path).args(["fsmonitor--daemon", "stop"]).output();
+        let _ = gitfix::git(&b.path).args(["maintenance", "unregister", "--force"]).output();
         if has_compose_file(&b.path) {
             println!(
                 "  note: if you started docker compose here, stop it with: docker compose -p {} down",
@@ -641,7 +495,6 @@ fn cmd_rm(name: &str, force: bool) -> Result<()> {
             );
         }
         trash(&b)?;
-        phase("delete folder", &mut p);
     }
     registry::delete(&b)?;
     println!("✓ removed {}", b.name);
@@ -690,17 +543,12 @@ fn purge_trash() {
     }
 }
 
-/// Everything `wb rm` would lose, in every repo of the workbench and their submodules.
+/// Everything `wb rm` would lose, in the workbench and its submodules.
 fn unsaved_work(b: &Bench) -> Result<Vec<String>> {
-    let mut problems = Vec::new();
-    for rel in &b.repos {
-        let root = b.path.join(rel);
-        let mut repos = vec![rel.clone()];
-        repos.extend(gitfix::submodules(&root)?.into_iter().map(|s| rel.join(s)));
-        for r in repos {
-            for p in gitfix::unsaved_work(&b.path.join(&r), &b.source.join(&r), b.created)? {
-                problems.push(format!("{}{p}", label(&r)));
-            }
+    let mut problems = gitfix::unsaved_work(&b.path, &b.source, b.created)?;
+    for sub in gitfix::submodules(&b.path)? {
+        for p in gitfix::unsaved_work(&b.path.join(&sub), &b.source.join(&sub), b.created)? {
+            problems.push(format!("{}: {p}", sub.display()));
         }
     }
     Ok(problems)
@@ -787,35 +635,31 @@ fn cmd_env(name: &str) -> Result<()> {
 
 fn cmd_land(name: &str) -> Result<()> {
     let b = resolve(name)?;
-    for rel in &b.repos {
-        let (dst, src) = (b.path.join(rel), b.source.join(rel));
-        let label = label(rel);
-        let Some(branch) = gitfix::out(&dst, &["branch", "--show-current"]).filter(|s| !s.is_empty()) else {
-            bail!("{label}the workbench isn't on a branch (detached HEAD); check one out first");
-        };
-        let dirty = gitfix::run(&dst, &["status", "--porcelain"])?.lines().count();
-        if dirty > 0 {
-            println!("  ! {label}{dirty} uncommitted change(s) stay behind; only commits are landed");
-        }
-        let dst_s = dst.display().to_string();
-        if checked_out_in(&src, &branch) {
-            // Git won't move a checked-out branch under someone's feet.
-            gitfix::run(
-                &src,
-                &["fetch", "--no-tags", "--recurse-submodules=no", &dst_s, &format!("refs/heads/{branch}")],
-            )?;
-            println!("✓ {label}fetched '{branch}'. It's checked out in the original, so merge it there:");
-            println!("    git -C \"{}\" merge FETCH_HEAD", src.display());
-        } else {
-            let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
-            if let Err(e) = gitfix::run(&src, &["fetch", "--no-tags", "--recurse-submodules=no", &dst_s, &refspec]) {
-                if format!("{e:#}").contains("non-fast-forward") {
-                    bail!("{label}'{branch}' in the original has commits the workbench doesn't; merge or rebase first");
-                }
-                return Err(e.context(format!("{label}landing '{branch}'")));
+    let (dst, src) = (&b.path, &b.source);
+    let Some(branch) = gitfix::out(dst, &["branch", "--show-current"]).filter(|s| !s.is_empty()) else {
+        bail!("the workbench isn't on a branch (detached HEAD); check one out first");
+    };
+    let dirty = gitfix::run(dst, &["status", "--porcelain"])?.lines().count();
+    if dirty > 0 {
+        println!("  ! {dirty} uncommitted change(s) stay behind; only commits are landed");
+    }
+    let dst_s = dst.display().to_string();
+    // Submodule commits aren't landed (the README says so); don't let git try.
+    let fetch = ["fetch", "--no-tags", "--recurse-submodules=no", &dst_s];
+    if checked_out_in(src, &branch) {
+        // Git won't move a checked-out branch under someone's feet.
+        gitfix::run(src, &[&fetch[..], &[&format!("refs/heads/{branch}")]].concat())?;
+        println!("✓ fetched '{branch}'. It's checked out in the original, so merge it there:");
+        println!("    git -C \"{}\" merge FETCH_HEAD", src.display());
+    } else {
+        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+        if let Err(e) = gitfix::run(src, &[&fetch[..], &[&refspec]].concat()) {
+            if format!("{e:#}").contains("non-fast-forward") {
+                bail!("'{branch}' in the original has commits the workbench doesn't; merge or rebase first");
             }
-            println!("✓ {label}branch '{branch}' is now in {}", tilde(&src));
+            return Err(e.context(format!("landing '{branch}'")));
         }
+        println!("✓ branch '{branch}' is now in {}", tilde(src));
     }
     Ok(())
 }

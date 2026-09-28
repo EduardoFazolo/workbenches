@@ -5,7 +5,7 @@ description: Use `wb` (workbenches) to work on a git repo in an isolated copy wi
 
 # workbenches (`wb`)
 
-`wb` makes instant, independent copies of a git repo called **workbenches**. Each one is a full copy of the repo folder, including its own `.git`, `.env`, `node_modules`, build caches and any uncommitted changes. It sits on its own branch and owns a block of 10 ports. Several can run dev servers at the same time as the original.
+`wb` makes independent copies of a git repo, called **workbenches**. Each one is a full copy of the repo folder, including its own `.git`, `.env`, `node_modules`, build caches and any uncommitted changes. It sits on its own branch and owns a block of 10 ports. Several can run dev servers at the same time as the original.
 
 A workbench is **not** a git worktree. Never use `git worktree` commands with it.
 
@@ -152,7 +152,7 @@ Only use `--force` when the user explicitly says to throw the work away.
 
 ## Optional per-repo setup: `.wb/setup`
 
-If the repo contains an executable `.wb/setup` (Windows: `.wb/setup.cmd`, `.bat` or `.ps1`), it runs inside every new workbench with the env above. Use it for things that can't be copied, and suggest adding one if the user hits a shared-database problem:
+If the repo contains an executable `.wb/setup`, it runs inside every new workbench with the env above. Use it for things that can't be copied, and suggest adding one if the user hits a shared-database problem:
 
 ```sh
 #!/bin/sh
@@ -169,7 +169,7 @@ printf 'DATABASE_URL=postgres://localhost/myapp_%s\nPORT=%s\n' "$WB_NAME" "$WB_P
 - **Same branch name, different branches.** A branch named `main` in the workbench and in the original are separate after the copy. Commits in one appear in the other only through `wb land`, fetch, push or pull.
 - **`origin` and your git identity came along,** so `git push` and commits work normally.
 - **Copies live in `~/.workbenches/<project>/<name>`** (or `$WB_HOME`). Nothing is written into the original repo.
-- **Deleting is instant.** `wb rm` moves the folder to a trash area and deletes it in the background.
+- **`wb rm` returns at once.** It moves the folder to a trash area and deletes it in the background.
 - **Installing packages in a workbench** (`npm install`, `pip install`) affects only that workbench.
 
 ## Install this guide as a skill

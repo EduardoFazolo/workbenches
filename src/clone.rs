@@ -1,7 +1,7 @@
 //! Copy a whole folder as cheaply as the filesystem allows.
 //!
 //! - macOS/APFS: one `clonefile(2)` call clones the entire tree copy-on-write.
-//! - Linux (btrfs, XFS) and Windows (ReFS, Dev Drive): walk the tree and
+//! - Linux (btrfs, XFS) and Windows (ReFS, Dev Drive; untested): walk the tree and
 //!   reflink each file.
 //! - Anything else can only do a real copy, which we refuse unless asked
 //!   (`--copy`), because a silent 10 GB copy is worse than an error.

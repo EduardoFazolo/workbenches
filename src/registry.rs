@@ -26,9 +26,6 @@ pub struct Bench {
     /// The copy.
     pub path: PathBuf,
     pub branch: String,
-    /// Git repos inside the copy, relative to its root ("" = the root itself).
-    /// More than one when the source is a folder holding several repos.
-    pub repos: Vec<PathBuf>,
     /// First port of this bench's block of `PORT_BLOCK`.
     pub port: u16,
     pub created: u64,
@@ -233,7 +230,6 @@ mod tests {
             source: PathBuf::new(),
             path: PathBuf::new(),
             branch: name.into(),
-            repos: vec![PathBuf::new()],
             port: PORT_START,
             created: 0,
         }
