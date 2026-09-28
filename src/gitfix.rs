@@ -191,48 +191,31 @@ pub fn fix_clone(src_repo: &Path, dst_repo: &Path, branch: &str) -> Result<Vec<S
     Ok(notes)
 }
 
-/// What deleting the copy `dst` would lose: uncommitted changes, stash entries,
-/// branches and a detached HEAD whose commits neither the original `src` nor a
-/// remote has. Deliberately simple: deleted copies stay in the trash for a few
-/// days, which covers what this doesn't. Errs when git can't answer.
-pub fn unsaved_work(dst: &Path, src: &Path) -> Result<Vec<String>> {
-    let mut problems = Vec::new();
-    let dirty = run(dst, &["status", "--porcelain"])?.lines().count();
-    if dirty > 0 {
-        problems.push(format!("{dirty} uncommitted change(s)"));
+/// What in `repo` isn't saved anywhere else, for a heads-up before it goes to
+/// the trash: changed files, stash entries, and branches with commits no remote
+/// has. Best effort: it informs, it never blocks.
+pub fn not_saved(repo: &Path) -> Vec<String> {
+    let mut notes = Vec::new();
+    let Some(status) = out(repo, &["status", "--porcelain"]) else {
+        return vec!["(git couldn't read this repo, so check the trash copy yourself)".into()];
+    };
+    let files: Vec<&str> = status.lines().map(|l| l.get(3..).unwrap_or(l)).collect();
+    if !files.is_empty() {
+        let more = files.len().saturating_sub(5);
+        let more = if more > 0 { format!(" (+{more} more)") } else { String::new() };
+        notes.push(format!("uncommitted: {}{more}", files[..files.len().min(5)].join(", ")));
     }
-    // (commit, what it is to the user)
-    let mut tips: Vec<(String, String)> = Vec::new();
-    for line in run(dst, &["for-each-ref", "--format=%(objectname) %(refname:short)", "refs/heads"])?.lines() {
-        if let Some((sha, branch)) = line.split_once(' ') {
-            tips.push((sha.into(), format!("branch '{branch}'")));
+    let stashes = out(repo, &["stash", "list"]).map(|s| s.lines().count()).unwrap_or(0);
+    if stashes > 0 {
+        notes.push(format!("{stashes} stash entr{}", if stashes == 1 { "y" } else { "ies" }));
+    }
+    for branch in out(repo, &["for-each-ref", "--format=%(refname:short)", "refs/heads"]).unwrap_or_default().lines() {
+        let ahead = out(repo, &["rev-list", "--count", branch, "--not", "--remotes"]).unwrap_or_default();
+        if ahead.parse::<u32>().is_ok_and(|n| n > 0) {
+            notes.push(format!("branch {branch}: {ahead} commit(s) not on any remote"));
         }
     }
-    if out(dst, &["symbolic-ref", "-q", "HEAD"]).is_none()
-        && let Some(head) = out(dst, &["rev-parse", "--verify", "--quiet", "HEAD"])
-    {
-        tips.push((head, "the detached HEAD".into()));
-    }
-    if out(dst, &["rev-parse", "--verify", "--quiet", "refs/stash"]).is_some() {
-        for sha in run(dst, &["log", "-g", "--format=%H", "refs/stash"])?.lines() {
-            tips.push((sha.into(), "a stash entry".into()));
-        }
-    }
-    for (sha, what) in tips {
-        let in_source = git(src)
-            .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
-        let pushed = || -> Result<bool> {
-            Ok(!run(dst, &["for-each-ref", "--count=1", "--contains", &sha, "refs/remotes"])?.is_empty())
-        };
-        let problem = format!("{what} has commits that exist only here");
-        if !in_source && !pushed()? && !problems.contains(&problem) {
-            problems.push(problem);
-        }
-    }
-    Ok(problems)
+    notes
 }
 
 #[cfg(unix)]

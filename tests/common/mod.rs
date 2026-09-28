@@ -360,7 +360,7 @@ impl<'a> Cleanup<'a> {
 impl Drop for Cleanup<'_> {
     fn drop(&mut self) {
         for name in &self.workbenches {
-            let _ = self.env.wb(&["rm", "--force", name]).in_dir(&self.from).run();
+            let _ = self.env.wb(&["rm", name]).in_dir(&self.from).run();
         }
         for c in &mut self.children {
             let _ = c.kill();

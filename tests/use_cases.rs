@@ -7,7 +7,7 @@ mod common;
 
 use common::*;
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -507,6 +507,39 @@ fn git_hooks_point_at_the_copy() {
 }
 
 #[test]
+fn an_editable_install_of_the_repo_imports_the_copy() {
+    let env = Env::new();
+    let repo = env.repo("app");
+    env.commit(&repo, ".gitignore", ".venv/\n", "ignore venv");
+    env.commit(&repo, "mymodule.py", "value = 'original'\n", "module");
+    let site = ".venv/lib/python3.12/site-packages";
+    write(&repo.join(".venv/pyvenv.cfg"), "home = /usr/bin\n");
+    write(&repo.join(site).join("editable.pth"), &format!("{}\n", repo.display()));
+
+    let wb = env.new_workbench(&repo, "feat");
+    write(&wb.join("mymodule.py"), "value = 'copy'\n");
+
+    let code = "import site, sys; site.addsitedir(sys.argv[1]); import mymodule; print(mymodule.value)";
+    let out = env.command("python3").args(["-c", code, wb.join(site).to_str().unwrap()]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "copy", "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn a_hooks_folder_shared_through_a_symlink_is_not_modified() {
+    let env = Env::new();
+    let repo = env.repo("app");
+    let shared = env.dir("shared-hooks");
+    let hook = format!("#!/bin/sh\necho {}/scripts\n", repo.display());
+    write(&shared.join("helper.sh"), &hook);
+    fs::remove_dir_all(repo.join(".git/hooks")).unwrap();
+    symlink(&shared, repo.join(".git/hooks")).unwrap();
+
+    env.new_workbench(&repo, "feat");
+
+    assert_eq!(read(&shared.join("helper.sh")), hook, "wb new changed a file outside the copy");
+}
+
+#[test]
 fn committed_files_mentioning_the_original_are_left_alone() {
     let env = Env::new();
     let repo = env.repo("app");
@@ -976,7 +1009,7 @@ fn every_command_refuses_an_unknown_workbench_name() {
         vec!["shell", "ghost"],
         vec!["land", "ghost"],
         vec!["rm", "ghost"],
-        vec!["rm", "--force", "ghost"],
+        vec!["rm", "ghost"],
     ] {
         let out = env.wb(&args).in_dir(&repo).fails();
         assert!(out.mentions("ghost"), "should name what wasn't found\n{out}");
@@ -990,7 +1023,7 @@ fn an_unknown_project_in_project_slash_name_is_reported_as_such() {
     let repo = env.repo("app");
     let real = env.new_workbench(&repo, "real");
 
-    let out = env.wb(&["rm", "--force", "nope/real"]).in_dir(&repo).fails();
+    let out = env.wb(&["rm", "nope/real"]).in_dir(&repo).fails();
 
     assert!(out.mentions("nope"), "should say project 'nope' wasn't found, not that 'real' doesn't exist\n{out}");
     assert!(real.exists(), "app/real must not be touched");
@@ -1112,101 +1145,45 @@ fn rm_deletes_a_clean_workbench_and_frees_its_name() {
 }
 
 #[test]
-fn rm_refuses_when_uncommitted_changes_would_be_lost() {
+fn rm_moves_unsaved_work_to_the_trash_and_says_what_it_had() {
     let env = Env::new();
     let repo = env.repo("app");
     let wb = env.new_workbench(&repo, "feat");
-    write(&wb.join("README.md"), "unsaved edit\n");
-
-    let out = env.wb(&["rm", "feat"]).in_dir(&repo).fails();
-
-    assert!(out.mentions_any(&["uncommitted", "README.md"]), "{out}");
-    assert_eq!(read(&wb.join("README.md")), "unsaved edit\n");
-}
-
-#[test]
-fn rm_refuses_when_an_untracked_file_would_be_lost() {
-    let env = Env::new();
-    let repo = env.repo("app");
-    let wb = env.new_workbench(&repo, "feat");
-    write(&wb.join("brand-new.txt"), "never added\n");
-
-    env.wb(&["rm", "feat"]).in_dir(&repo).fails();
-
-    assert!(wb.join("brand-new.txt").exists());
-}
-
-#[test]
-fn rm_refuses_when_a_commit_exists_only_on_its_branch() {
-    let env = Env::new();
-    let repo = env.repo("app");
-    let wb = env.new_workbench(&repo, "feat");
-    env.git(&wb, &["switch", "-qc", "side-work"]);
-    env.commit(&wb, "a.txt", "a\n", "unlanded");
-    env.git(&wb, &["switch", "-q", "feat"]);
-
-    let out = env.wb(&["rm", "feat"]).in_dir(&repo).fails();
-
-    assert!(out.mentions("side-work"), "should name the branch at risk\n{out}");
-    assert!(wb.exists());
-}
-
-#[test]
-fn rm_refuses_when_a_commit_exists_only_on_a_detached_head() {
-    let env = Env::new();
-    let repo = env.repo("app");
-    let wb = env.new_workbench(&repo, "feat");
-    env.git(&wb, &["switch", "-q", "--detach"]);
-    env.commit(&wb, "x.txt", "x\n", "detached work");
-
-    let out = env.wb(&["rm", "feat"]).in_dir(&repo).fails();
-
-    assert!(out.mentions("detached"), "{out}");
-    assert!(wb.exists());
-}
-
-#[test]
-fn rm_refuses_when_a_stash_would_be_lost() {
-    let env = Env::new();
-    let repo = env.repo("app");
-    let wb = env.new_workbench(&repo, "feat");
-    write(&wb.join("README.md"), "stashed idea\n");
+    env.commit(&wb, "work.txt", "committed, never pushed\n", "work");
+    write(&wb.join("README.md"), "edited\n");
     env.git(&wb, &["stash", "-q"]);
-    assert_eq!(env.git(&wb, &["status", "--porcelain"]), "");
+    write(&wb.join("notes.txt"), "untracked\n");
 
-    let out = env.wb(&["rm", "feat"]).in_dir(&repo).fails();
-
-    assert!(out.mentions("stash"), "{out}");
-    assert!(wb.exists());
-}
-
-#[test]
-fn rm_refuses_when_git_cannot_answer() {
-    let env = Env::new();
-    let repo = env.repo("app");
-    let wb = env.new_workbench(&repo, "feat");
-    let mut config = read(&wb.join(".git/config"));
-    config.push_str("[this is not valid\n");
-    write(&wb.join(".git/config"), &config);
-    assert!(!env.try_git(&wb, &["status"]).ok(), "setup: git should fail in the broken copy");
-
-    env.wb(&["rm", "feat"]).in_dir(&repo).fails();
-
-    assert!(wb.exists());
-}
-
-#[test]
-fn rm_allows_after_landing() {
-    let env = Env::new();
-    let repo = env.repo("app");
-    let wb = env.new_workbench(&repo, "feat");
-    env.commit(&wb, "a.txt", "a\n", "work");
-    env.wb(&["rm", "feat"]).in_dir(&repo).fails();
-
-    env.wb(&["land", "feat"]).in_dir(&repo).succeeds();
-    env.wb(&["rm", "feat"]).in_dir(&repo).succeeds();
+    let out = env.wb(&["rm", "feat"]).in_dir(&repo).succeeds();
 
     assert!(!wb.exists());
+    assert!(out.mentions("notes.txt"), "names the uncommitted file\n{out}");
+    assert!(out.mentions("stash"), "{out}");
+    assert!(out.mentions("branch feat"), "{out}");
+    let kept: Vec<_> = fs::read_dir(env.wb_home.join(".trash")).unwrap().flatten().collect();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(read(&kept[0].path().join("notes.txt")), "untracked\n", "everything is recoverable from the trash");
+    assert_eq!(env.git(&kept[0].path(), &["log", "-1", "--format=%s", "feat"]), "work");
+}
+
+#[test]
+fn rm_keeps_the_workbench_when_the_trash_cant_take_it() {
+    let env = Env::new();
+    let repo = env.repo("app");
+    let wb = env.new_workbench(&repo, "feat");
+    let trash = env.wb_home.join(".trash");
+    fs::create_dir_all(&trash).unwrap();
+    fs::set_permissions(&trash, fs::Permissions::from_mode(0o555)).unwrap();
+    if fs::write(trash.join("probe"), "").is_ok() {
+        eprintln!("skipped: running as root, so a read-only folder can't be simulated");
+        return;
+    }
+
+    let out = env.wb(&["rm", "feat"]).in_dir(&repo).fails();
+    fs::set_permissions(&trash, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(wb.exists(), "nothing is deleted when it can't be kept\n{out}");
+    assert_eq!(env.path_of(&repo, "feat"), wb, "and it's still a workbench");
 }
 
 #[test]
@@ -1216,7 +1193,7 @@ fn rm_keeps_the_deleted_copy_for_three_days() {
     let wb = env.new_workbench(&repo, "feat");
     write(&wb.join("scratch.txt"), "notes\n");
 
-    let out = env.wb(&["rm", "feat", "--force"]).in_dir(&repo).succeeds();
+    let out = env.wb(&["rm", "feat"]).in_dir(&repo).succeeds();
 
     assert!(!wb.exists());
     assert!(out.mentions("3 days"), "rm says where the copy went\n{out}");
@@ -1238,20 +1215,6 @@ fn rm_allows_after_pushing() {
     env.wb(&["rm", "feat"]).in_dir(&repo).succeeds();
 
     assert!(!wb.exists());
-}
-
-#[test]
-fn rm_force_deletes_despite_unsaved_work() {
-    let env = Env::new();
-    let repo = env.repo("app");
-    let wb = env.new_workbench(&repo, "feat");
-    env.commit(&wb, "a.txt", "a\n", "unlanded");
-    write(&wb.join("README.md"), "unsaved\n");
-
-    env.wb(&["rm", "--force", "feat"]).in_dir(&repo).succeeds();
-
-    assert!(!wb.exists());
-    env.wb(&["path", "feat"]).in_dir(&repo).fails();
 }
 
 #[test]
@@ -1364,9 +1327,9 @@ fn a_deleted_original_repo_does_not_break_wb() {
     env.wb(&["path", "feat"]).in_dir(&nowhere).run().assert_no_crash();
     env.wb(&["land", "feat"]).in_dir(&nowhere).fails();
     env.wb(&["rm", "feat"]).in_dir(&nowhere).run().assert_no_crash();
-    env.wb(&["rm", "--force", "feat"]).in_dir(&nowhere).run().assert_no_crash();
+    env.wb(&["rm", "feat"]).in_dir(&nowhere).run().assert_no_crash();
 
-    assert!(!wb.exists(), "rm --force should still delete the workbench");
+    assert!(!wb.exists(), "rm should still remove the workbench");
 }
 
 // ───────────────────────── The CLI ─────────────────────────

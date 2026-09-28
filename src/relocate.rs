@@ -44,7 +44,7 @@ pub fn relocate(src: &Path, dst: &Path) -> Result<Stats> {
                 Some(files_in(&path.join("hooks")))
             } else if e.file_name() == "node_modules" {
                 Some(files_in(&path.join(".bin")))
-            } else if path.join("pyvenv.cfg").is_file() {
+            } else if is_real(&path.join("pyvenv.cfg"), false) {
                 Some(venv_files(path))
             } else {
                 None
@@ -75,8 +75,17 @@ pub fn relocate(src: &Path, dst: &Path) -> Result<Stats> {
     Ok(stats)
 }
 
-/// Regular files directly in `dir` (symlinks are left alone).
+/// A real file or folder, not a symlink. Symlinks are never followed: they can
+/// lead outside the copy (a shared hooks folder, say), and files there aren't ours.
+fn is_real(p: &Path, dir: bool) -> bool {
+    fs::symlink_metadata(p).is_ok_and(|m| if dir { m.is_dir() } else { m.is_file() })
+}
+
+/// Regular files directly in `dir`.
 fn files_in(dir: &Path) -> Vec<PathBuf> {
+    if !is_real(dir, true) {
+        return Vec::new();
+    }
     let Ok(rd) = fs::read_dir(dir) else { return Vec::new() };
     rd.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_file())).map(|e| e.path()).collect()
 }
@@ -85,8 +94,8 @@ fn venv_files(venv: &Path) -> Vec<PathBuf> {
     let mut out = vec![venv.join("pyvenv.cfg")];
     out.extend(files_in(&venv.join("bin")));
     out.extend(files_in(&venv.join("Scripts")));
-    for lib in ["lib", "lib64"] {
-        for python in fs::read_dir(venv.join(lib)).into_iter().flatten().flatten() {
+    for lib in ["lib", "lib64"].map(|l| venv.join(l)).into_iter().filter(|l| is_real(l, true)) {
+        for python in fs::read_dir(lib).into_iter().flatten().flatten() {
             let site = python.path().join("site-packages");
             out.extend(
                 files_in(&site).into_iter().filter(|p| p.extension().is_some_and(|x| x == "pth" || x == "egg-link")),
@@ -113,13 +122,12 @@ fn untracked(repo: &Path, paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
-/// Every spelling of `<original>/` a tool might have written, paired with `<copy>/`.
-/// Matching the trailing `/` means only paths inside the original match, never a
-/// sibling like `app data` next to `app`.
+/// Every spelling of the original's path a tool might have written, paired with
+/// the copy's.
 fn pairs(src: &Path, dst: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let slash = |p: &Path| format!("{}/", p.to_string_lossy().trim_end_matches('/'));
-    let new = slash(&canonical(dst));
-    let mut olds = vec![slash(src), slash(&canonical(src))];
+    let trim = |p: &Path| p.to_string_lossy().trim_end_matches('/').to_string();
+    let new = trim(&canonical(dst));
+    let mut olds = vec![trim(src), trim(&canonical(src))];
     // macOS: /var, /tmp and /etc are symlinks into /private, and tools record
     // whichever spelling they were handed.
     for o in olds.clone() {
@@ -134,15 +142,20 @@ fn pairs(src: &Path, dst: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
     olds.into_iter().map(|o| (o.into_bytes(), new.clone().into_bytes())).collect()
 }
 
-/// Replace every occurrence that starts a path (so `/var/x/` isn't matched
-/// inside `/private/var/x/`, which has its own pair).
+/// Replace the original's path where it's a whole path, or the start of one:
+/// followed by `/`, a line end, a quote or the end of the file. So `app data`
+/// next to `app` never matches, and `/var/x` isn't matched inside `/private/var/x`
+/// (which has its own pair).
 fn replace_all(data: &[u8], pairs: &[(Vec<u8>, Vec<u8>)]) -> Option<Vec<u8>> {
     let mut out = data.to_vec();
     let mut changed = false;
     for (old, new) in pairs {
-        let starts =
-            |d: &[u8], pos: usize| pos == 0 || !(d[pos - 1].is_ascii_alphanumeric() || b"_-.".contains(&d[pos - 1]));
-        let hits: Vec<usize> = memmem::find_iter(&out, old).filter(|&pos| starts(&out, pos)).collect();
+        let whole = |d: &[u8], pos: usize| {
+            let before = pos == 0 || !(d[pos - 1].is_ascii_alphanumeric() || b"_-.".contains(&d[pos - 1]));
+            let after = d.get(pos + old.len()).is_none_or(|c| b"/\n\r\"'".contains(c));
+            before && after
+        };
+        let hits: Vec<usize> = memmem::find_iter(&out, old).filter(|&pos| whole(&out, pos)).collect();
         if hits.is_empty() {
             continue;
         }
@@ -160,11 +173,12 @@ fn replace_all(data: &[u8], pairs: &[(Vec<u8>, Vec<u8>)]) -> Option<Vec<u8>> {
     changed.then_some(out)
 }
 
-/// Rewrites a small text file in place, keeping its mtime and permissions.
-/// Returns whether it changed.
+/// Rewrites a small text file, keeping its mtime and permissions. The new
+/// content goes to a new file renamed over the old one, so even a file
+/// hardlinked with the original can't change it. Returns whether it changed.
 fn rewrite(path: &Path, pairs: &[(Vec<u8>, Vec<u8>)]) -> io::Result<bool> {
-    let md = fs::metadata(path)?;
-    if md.len() == 0 || md.len() > MAX_TEXT {
+    let md = fs::symlink_metadata(path)?;
+    if !md.is_file() || md.len() == 0 || md.len() > MAX_TEXT {
         return Ok(false);
     }
     let data = fs::read(path)?;
@@ -172,20 +186,17 @@ fn rewrite(path: &Path, pairs: &[(Vec<u8>, Vec<u8>)]) -> io::Result<bool> {
         return Ok(false); // binary
     }
     let Some(new) = replace_all(&data, pairs) else { return Ok(false) };
-    let perms = md.permissions();
-    if perms.readonly() {
-        let mut writable = perms.clone();
-        #[allow(clippy::permissions_set_readonly_false)]
-        writable.set_readonly(false);
-        fs::set_permissions(path, writable)?;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".wb-tmp");
+    let tmp = PathBuf::from(tmp);
+    let replaced = fs::write(&tmp, new)
+        .and_then(|()| fs::set_permissions(&tmp, md.permissions()))
+        .and_then(|()| filetime::set_file_mtime(&tmp, FileTime::from_last_modification_time(&md)))
+        .and_then(|()| fs::rename(&tmp, path));
+    if replaced.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    let written = fs::write(path, new);
-    if perms.readonly() {
-        fs::set_permissions(path, perms)?;
-    }
-    written?;
-    filetime::set_file_mtime(path, FileTime::from_last_modification_time(&md))?;
-    Ok(true)
+    replaced.map(|()| true)
 }
 
 #[cfg(test)]
@@ -193,13 +204,16 @@ mod tests {
     use super::*;
 
     fn p() -> Vec<(Vec<u8>, Vec<u8>)> {
-        vec![(b"/src/app/".to_vec(), b"/wb/app/x/".to_vec())]
+        vec![(b"/src/app".to_vec(), b"/wb/app/x".to_vec())]
     }
 
     #[test]
-    fn replaces_paths_inside_the_original_only() {
+    fn replaces_the_original_and_paths_inside_it_only() {
         let r = replace_all(b"#!/src/app/.venv/bin/python\nPATH=/src/app/bin:/src/app/x\n", &p()).unwrap();
         assert_eq!(r, b"#!/wb/app/x/.venv/bin/python\nPATH=/wb/app/x/bin:/wb/app/x/x\n");
+        assert_eq!(replace_all(b"/src/app\n", &p()).unwrap(), b"/wb/app/x\n", "a .pth line naming the root");
+        assert_eq!(replace_all(b"ROOT='/src/app'", &p()).unwrap(), b"ROOT='/wb/app/x'");
+        assert_eq!(replace_all(b"/src/app", &p()).unwrap(), b"/wb/app/x");
         assert!(replace_all(b"/src/app-old/x", &p()).is_none());
         assert!(replace_all(b"/src/app data/x", &p()).is_none());
         assert!(replace_all(b"/private/src/app/x", &p()).is_none());
@@ -210,7 +224,7 @@ mod tests {
     fn knows_both_spellings_of_private_paths() {
         let olds: Vec<Vec<u8>> =
             pairs(Path::new("/private/tmp/app"), Path::new("/x")).into_iter().map(|(o, _)| o).collect();
-        assert!(olds.contains(&b"/private/tmp/app/".to_vec()));
-        assert!(olds.contains(&b"/tmp/app/".to_vec()));
+        assert!(olds.contains(&b"/private/tmp/app".to_vec()));
+        assert!(olds.contains(&b"/tmp/app".to_vec()));
     }
 }

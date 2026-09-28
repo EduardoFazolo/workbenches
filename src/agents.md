@@ -15,7 +15,7 @@ A workbench is **not** a git worktree. Never use `git worktree` commands with it
 2. **Work only inside the workbench folder.** Get it with `wb path <name>`. Never edit files in the original repo (`WB_SOURCE`) while working in a workbench.
 3. **Never hardcode ports.** Start servers with `wb run <name> -- <cmd>` so `PORT` is set. To pass the port as an argument, wrap the command in `sh -c` with single quotes so `$PORT` expands inside the workbench: `wb run <name> -- sh -c 'npx vite --port $PORT --strictPort'`.
 4. **Commit inside the workbench**, then `wb land <name>` or `git push`. Uncommitted work is never landed.
-5. **Never `wb rm --force` and never `rm -rf` a workbench yourself.** If `wb rm` refuses, work would be lost. Report that to the user and let them decide.
+5. **Save work before `wb rm`, and never `rm -rf` a workbench yourself.** `wb rm` doesn't block: it moves the copy to the trash for 3 days. Deciding what's work is your job (see "Removing a workbench").
 6. **Read `wb` output and errors in full.** They say exactly what happened and what to do next.
 
 ## Commands
@@ -33,7 +33,7 @@ A workbench is **not** a git worktree. Never use `git worktree` commands with it
 | `wb shell <name>` | Interactive shell in the workbench (humans; agents should use `wb run` or `cd`) |
 | `wb env <name>` | Print the env as `export` lines (`eval "$(wb env <name>)"`) |
 | `wb land <name>` | Fetch the workbench's current branch into the original repo |
-| `wb rm <name>` | Stop processes running inside it and delete it; refuses if work would be lost |
+| `wb rm <name>` | Stop processes running inside it and move it to the trash (kept 3 days); lists what wasn't saved |
 
 When two repos have workbenches with the same name, use `project/name`. `wb ls --all` shows them.
 
@@ -125,15 +125,16 @@ Files, git state and ports are isolated. External services are **shared** unless
 | bad name | Bad workbench name | Use letters, digits, `-`, `_`, `.` (not starting with `.` or `-`) |
 | isn't a valid git branch name | Bad `--branch` | Use letters, digits, `-`, `_`, `.`, `/` |
 
-## When `wb rm` refuses
+## Removing a workbench
 
-It lists what would be lost: uncommitted changes (untracked files included), or a branch, stash entry or detached HEAD with commits that neither the original nor a remote has. If git fails, it refuses: report the error to the user. Deleted copies stay in `~/.workbenches/.trash` for 3 days.
+`wb rm` doesn't check whether the work is safe to remove; you do, because only you know which changes are real work in this project. Before `wb rm <name>`:
 
-1. Commit what matters inside the workbench.
-2. Then `wb land <name>` or `git push`.
-3. Then `wb rm <name>` again.
+1. `git status` in the workbench. Commit real work. Changes a tool made on its own (a dev server rewriting `AGENTS.md`, a regenerated lockfile, build output) can be discarded with `git checkout -- <file>` or left; say which in your report.
+2. `git push` the branch, or `wb land <name>`. Check `git log origin/<branch>..<branch>` is empty if you pushed.
+3. Unsure whether something matters? Ask the user before removing.
+4. `wb rm <name>`. Read its output: it lists anything that wasn't saved elsewhere (uncommitted files, stash entries, unpushed branches). If it lists something you didn't expect, tell the user where the copy went.
 
-Only use `--force` when the user explicitly says to throw the work away.
+A removed copy stays in `~/.workbenches/.trash` for 3 days. To recover it, move its folder out of the trash; it's a normal git repo. If `wb rm` can't move the copy to the trash, it deletes nothing and says so.
 
 ## Landing
 
@@ -167,7 +168,7 @@ printf 'DATABASE_URL=postgres://localhost/myapp_%s\nPORT=%s\n' "$WB_NAME" "$WB_P
 
 - **The workbench starts as an exact copy** of the original, including its uncommitted changes and untracked files at that moment. Check `git status` in the workbench before committing, so you don't commit someone else's in-progress edits by accident.
 - **Same branch name, different branches.** A branch named `main` in the workbench and in the original are separate after the copy. Commits in one appear in the other only through `wb land`, fetch, push or pull.
-- **`creating` in `wb ls`** means a `wb new` is still copying, or was interrupted. Other commands refuse that workbench until it's ready. If it stays that way, ask the user before `wb rm <name> --force`.
+- **`creating` in `wb ls`** means a `wb new` is still copying, or was interrupted. Other commands refuse that workbench until it's ready. If it stays that way, ask the user before `wb rm <name>`.
 - **`origin` and your git identity came along,** so `git push` and commits work normally.
 - **Copies live in `~/.workbenches/<project>/<name>`** (or `$WB_HOME`). Nothing is written into the original repo.
 - **`wb rm` returns at once.** It moves the folder to `~/.workbenches/.trash`, where it's kept for 3 days before being deleted in the background.

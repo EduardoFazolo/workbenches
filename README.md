@@ -74,7 +74,7 @@ Settings: `WB_HOME` moves the copies (default `~/.workbenches`; keep it on the s
    Nothing else is touched. It also deletes untracked `*.pid` files and `.next/dev/lock`, left by servers running in the original.
 5. **Runs `.wb/setup`** if the repo has one.
 
-Until the copy is done, `wb ls` shows it as `creating` and other commands refuse it. If `wb new` is interrupted, `wb rm <name> --force` cleans up.
+Until the copy is done, `wb ls` shows it as `creating` and other commands refuse it. If `wb new` is interrupted, `wb rm <name>` cleans up.
 
 ## `.wb/setup`
 
@@ -90,14 +90,9 @@ If it fails, the copy is kept and `wb new` tells you how to re-run it. `--no-set
 
 ## `wb rm`
 
-It stops the processes running inside the copy (shells are left alone, so a terminal tab `cd`'d into it stays open) and moves the copy to `~/.workbenches/.trash`, where it's kept for 3 days. To get it back, move the folder out; it's a normal git repo.
+It stops the processes running inside the copy (shells are left alone, so a terminal tab `cd`'d into it stays open) and moves the copy to `~/.workbenches/.trash`, where it's kept for 3 days. To get it back, move the folder out; it's a normal git repo. If the copy can't be moved to the trash, nothing is deleted.
 
-Before that, it refuses if the copy has:
-
-- uncommitted changes, untracked files included
-- a branch, stash entry or detached HEAD with commits that neither the original nor a remote has
-
-`wb land` or push, then `rm` again; `--force` skips the check. The check covers the everyday cases, not every place git can keep a commit; the trash is there for the rest.
+It doesn't decide whether your work is safe to remove: that depends on the project (a dev server that rewrites a file on every run isn't work). It lists what isn't saved anywhere else, by name: uncommitted files, stash entries, branches with commits no remote has. Before removing, commit what matters and push or `wb land` it; `wb rm --help` has the checklist.
 
 ## Speed
 
