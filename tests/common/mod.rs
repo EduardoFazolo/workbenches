@@ -44,7 +44,10 @@ impl Env {
         let gitconfig = home.join(".gitconfig");
         fs::write(
             &gitconfig,
-            "[protocol \"file\"]\n\tallow = always\n[init]\n\tdefaultBranch = main\n[advice]\n\tdetachedHead = false\n",
+            // No background maintenance: newer git detaches `gc`/`maintenance` after
+            // commits, and it would change repos while a test inspects them.
+            "[protocol \"file\"]\n\tallow = always\n[init]\n\tdefaultBranch = main\n[advice]\n\tdetachedHead = false\n\
+             [maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n",
         )
         .unwrap();
         Env { root: root.clone(), home, wb_home: root.join("wbhome"), gitconfig, _tmp: tmp }
@@ -232,9 +235,10 @@ impl Cmd {
         out
     }
 
-    /// Starts it in the background (output discarded).
+    /// Starts it in the background. Stdout is discarded; stderr is kept, so a
+    /// server that dies says why in the test output.
     pub fn spawn(mut self) -> Child {
-        self.cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap()
+        self.cmd.stdout(Stdio::null()).spawn().unwrap()
     }
 }
 
@@ -332,9 +336,12 @@ pub fn exited(child: &mut Child) -> bool {
     matches!(child.try_wait(), Ok(Some(_)))
 }
 
-/// A tiny HTTP server serving its current folder on $PORT.
-pub const PY_SERVER: &str = "import os, http.server as h\n\
-h.ThreadingHTTPServer(('127.0.0.1', int(os.environ['PORT'])), h.SimpleHTTPRequestHandler).serve_forever()";
+/// A tiny HTTP server serving its current folder on $PORT. Plain `TCPServer`, not
+/// `HTTPServer`: the latter does a reverse DNS lookup before listening, which can
+/// hang for a long time on CI machines.
+pub const PY_SERVER: &str = "import os, socketserver as s, http.server as h\n\
+class Server(s.ThreadingMixIn, s.TCPServer):\n    allow_reuse_address = True\n\
+Server(('127.0.0.1', int(os.environ['PORT'])), h.SimpleHTTPRequestHandler).serve_forever()";
 
 /// Kills background processes and force-removes workbenches when a test ends, even on failure.
 pub struct Cleanup<'a> {
