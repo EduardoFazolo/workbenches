@@ -15,7 +15,7 @@ A workbench is **not** a git worktree. Never use `git worktree` commands with it
 2. **Work only inside the workbench folder.** Get it with `wb path <name>`. Never edit files in the original repo (`WB_SOURCE`) while working in a workbench.
 3. **Never hardcode ports.** Start servers with `wb run <name> -- <cmd>` so `PORT` is set. To pass the port as an argument, wrap the command in `sh -c` with single quotes so `$PORT` expands inside the workbench: `wb run <name> -- sh -c 'npx vite --port $PORT --strictPort'`.
 4. **Commit inside the workbench**, then `wb land <name>` or `git push`. Uncommitted work is never landed.
-5. **Save work before `wb rm`, and never `rm -rf` a workbench yourself.** `wb rm` doesn't block: it moves the copy to the trash for 3 days. Deciding what's work is your job (see "Removing a workbench").
+5. **Removing a workbench is deleting its folder, and it's permanent.** Only do it when the user is done with it, after saving the work (see "Removing a workbench").
 6. **Read `wb` output and errors in full.** They say exactly what happened and what to do next.
 
 ## Commands
@@ -25,7 +25,7 @@ A workbench is **not** a git worktree. Never use `git worktree` commands with it
 | `wb new <name>` | Copy the repo you're in into a new workbench on branch `<name>` (created from current HEAD) |
 | `wb new <name> --branch <b>` | Same, but check out branch `<b>`. An existing branch is checked out, not recreated, including one that only exists on a remote (it then tracks it). |
 | `wb new <name> --from <path>` | Copy a repo you're not currently in |
-| `wb ls` | This repo's workbenches: branch, first port, status (`serving :3100` / `N processes` / `idle`), uncommitted files |
+| `wb ls` | This repo's workbenches: branch, first port, status (`serving :3100` / `idle` / `creating`), uncommitted files |
 | `wb ls --all` | Every workbench of every repo (shown as `project/name`) |
 | `wb path <name>` | Print the folder path |
 | `wb run <name> -- <cmd...>` | Run a command in the workbench folder with its env; returns the command's exit code |
@@ -33,7 +33,6 @@ A workbench is **not** a git worktree. Never use `git worktree` commands with it
 | `wb shell <name>` | Interactive shell in the workbench (humans; agents should use `wb run` or `cd`) |
 | `wb env <name>` | Print the env as `export` lines (`eval "$(wb env <name>)"`) |
 | `wb land <name>` | Fetch the workbench's current branch into the original repo |
-| `wb rm <name>` | Stop processes running inside it and move it to the trash (kept 3 days); lists what wasn't saved |
 
 When two repos have workbenches with the same name, use `project/name`. `wb ls --all` shows them.
 
@@ -60,7 +59,7 @@ cd "$(wb path fix-login)"               # 3. every edit and git command happens 
 git add -A && git commit -m "Fix login redirect"   # 4. commit inside the workbench
 wb land fix-login                       # 5a. bring the branch into the original repo
 # or: git push -u origin fix-login      # 5b. push and open a PR (origin came along)
-wb rm fix-login                         # 6. only when the user is done with it
+# 6. only when the user is done with it: see "Removing a workbench"
 ```
 
 Keep the workbench after landing if the user may want to review or run it. Removing it is the user's call unless they asked you to clean up.
@@ -83,7 +82,7 @@ wb ls                                 # STATUS should say: serving :<port>
 - **Scripts with a hardcoded port** (`next dev -p 3000`): don't edit tracked config just for this. Call the underlying command with `$PORT` instead: `wb run <name> -- sh -c 'npx next dev -p $PORT'`.
 - **Quoting matters.** `wb run x -- npx vite --port $PORT` passes YOUR shell's `$PORT`, which is usually empty or wrong. Use `sh -c '...'` with single quotes.
 - **Never test against `localhost:3000`** or any port outside your block. That's the user's main server or another agent's.
-- **Stopping:** stop your server (kill its pid, or let `wb rm` stop it) when you're done.
+- **Stopping:** stop your server when you're done. Kill the pid you started; a dev server can leave a child process holding the port, so check with `lsof -ti :$PORT` and kill what's left.
 
 ## Things a workbench does NOT isolate
 
@@ -127,14 +126,13 @@ Files, git state and ports are isolated. External services are **shared** unless
 
 ## Removing a workbench
 
-`wb rm` doesn't check whether the work is safe to remove; you do, because only you know which changes are real work in this project. Before `wb rm <name>`:
+`wb` has no remove command: a workbench is removed by deleting its folder, and that's permanent. Only you know which changes are real work in this project, so check before you delete:
 
-1. `git status` in the workbench. Commit real work. Changes a tool made on its own (a dev server rewriting `AGENTS.md`, a regenerated lockfile, build output) can be discarded with `git checkout -- <file>` or left; say which in your report.
-2. `git push` the branch, or `wb land <name>`. Check `git log origin/<branch>..<branch>` is empty if you pushed.
-3. Unsure whether something matters? Ask the user before removing.
-4. `wb rm <name>`. Read its output: it lists anything that wasn't saved elsewhere (uncommitted files, stash entries, unpushed branches). If it lists something you didn't expect, tell the user where the copy went.
-
-A removed copy stays in `~/.workbenches/.trash` for at least 3 days: each `wb rm` deletes trashed copies older than that, and nothing else does. To recover it, move its folder out of the trash; it's a normal git repo. If `wb rm` can't move the copy to the trash, it deletes nothing and says so.
+1. `git status` in the workbench. Commit real work. Changes a tool made on its own (a dev server rewriting `AGENTS.md`, a regenerated lockfile, build output) can go; say which in your report.
+2. `git push` the branch, or `wb land <name>`. If you pushed, `git log origin/<branch>..<branch>` should print nothing. Check `git stash list` too.
+3. Unsure whether something matters? Ask the user before deleting.
+4. Stop every process you started in it. Check its ports are free: `lsof -ti :$PORT` prints nothing.
+5. `rm -rf "$(wb path <name>)"`. `wb ls` stops listing it, and its name and ports are free again.
 
 ## Landing
 
@@ -168,10 +166,9 @@ printf 'DATABASE_URL=postgres://localhost/myapp_%s\nPORT=%s\n' "$WB_NAME" "$WB_P
 
 - **The workbench starts as an exact copy** of the original, including its uncommitted changes and untracked files at that moment. Check `git status` in the workbench before committing, so you don't commit someone else's in-progress edits by accident.
 - **Same branch name, different branches.** A branch named `main` in the workbench and in the original are separate after the copy. Commits in one appear in the other only through `wb land`, fetch, push or pull.
-- **`creating` in `wb ls`** means a `wb new` is still copying, or was interrupted. Other commands refuse that workbench until it's ready. If it stays that way, ask the user before `wb rm <name>`.
+- **`creating` in `wb ls`** means a `wb new` is still copying, or was interrupted. Other commands refuse that workbench until it's ready. If it stays that way, it was interrupted: ask the user before deleting its folder. After an hour it stops counting on its own.
 - **`origin` and your git identity came along,** so `git push` and commits work normally.
 - **Copies live in `~/.workbenches/<project>/<name>`** (or `$WB_HOME`). Nothing is written into the original repo.
-- **`wb rm` returns at once.** It moves the folder to `~/.workbenches/.trash`. Later `wb rm` runs delete trashed copies older than 3 days.
 - **Installing packages in a workbench** (`npm install`, `pip install`) affects only that workbench.
 
 ## Install this guide as a skill

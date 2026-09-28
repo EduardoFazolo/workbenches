@@ -26,9 +26,9 @@ cargo install --git https://github.com/EduardoFazolo/workbenches
 wb new login-fix                  # copy this repo: branch login-fix, ports 3100-3109
 wb run login-fix -- npm run dev   # run a command inside it with PORT=3100
 cd "$(wb path login-fix)"         # or work in it directly (wb shell login-fix opens a shell)
-wb ls                             # this repo's copies: branch, port, what's running, changes
+wb ls                             # this repo's copies: branch, port, what's serving, changes
 wb land login-fix                 # fetch its branch into the original repo
-wb rm login-fix                   # stop what runs inside it and delete it
+rm -rf "$(wb path login-fix)"     # delete it when you're done (stop its servers first)
 ```
 
 `--branch <b>` checks out an existing branch instead of creating one, including a branch that only exists on a remote (like `git switch`). `--from <path>` copies a repo you're not in.
@@ -74,7 +74,7 @@ Settings: `WB_HOME` moves the copies (default `~/.workbenches`; keep it on the s
    Nothing else is touched. It also deletes untracked `*.pid` files and `.next/dev/lock`, left by servers running in the original.
 5. **Runs `.wb/setup`** if the repo has one.
 
-Until the copy is done, `wb ls` shows it as `creating` and other commands refuse it. If `wb new` is interrupted, `wb rm <name>` cleans up.
+Until the copy is done, `wb ls` shows it as `creating` and other commands refuse it. If `wb new` is interrupted, delete the folder; a creation that hasn't finished in an hour stops counting anyway.
 
 ## `.wb/setup`
 
@@ -88,18 +88,15 @@ echo "DATABASE_URL=postgres://localhost/myapp_$WB_NAME" >> .env.local
 
 If it fails, the copy is kept and `wb new` tells you how to re-run it. `--no-setup` skips it.
 
-## `wb rm`
+## Removing a workbench
 
-It stops the processes running inside the copy (shells are left alone, so a terminal tab `cd`'d into it stays open) and moves the copy to `~/.workbenches/.trash`. If the copy can't be moved there, nothing is deleted.
+`wb` doesn't remove workbenches: you delete the folder. Which changes are work and which are noise depends on the project, so that call stays with you (or your agent):
 
-The trash:
+1. Save what matters: `git status` in the workbench, commit, then push or `wb land`.
+2. Stop the servers you started in it, so their ports free up.
+3. `rm -rf "$(wb path <name>)"`
 
-- **Nothing runs on a timer.** Each `wb rm` starts a background cleanup that deletes trashed copies older than 3 days.
-- **So 3 days is a minimum.** A copy stays until the first `wb rm` after it turns 3 days old. If you stop running `wb rm`, the trash never empties.
-- **To get a copy back,** move its folder out of the trash. It's a normal git repo.
-- **To empty it now,** delete what's in `~/.workbenches/.trash` yourself. That's safe.
-
-It doesn't decide whether your work is safe to remove: that depends on the project (a dev server that rewrites a file on every run isn't work). It lists what isn't saved anywhere else, by name: uncommitted files, stash entries, branches with commits no remote has. Before removing, commit what matters and push or `wb land` it; `wb rm --help` has the checklist.
+Once the folder is gone, the workbench is gone: `wb ls` stops listing it, and its name and ports can be used again.
 
 ## Speed
 
@@ -110,7 +107,6 @@ On an Apple Silicon Mac, `wb new` on a repo with 100k files (391 MB) takes about
 - **Windows support was written by AI and has never been run.** It compiles in CI, nothing more. Treat it as untested.
 - Paths are fixed only in the three places above. Any other file or symlink holding the original's absolute path still points at it; fix those in `.wb/setup`.
 - `wb land` lands the repo's branch, not commits made inside submodules. Push those first.
-- `wb rm` tells shells apart from dev servers by process name (`sh`, `bash`, `zsh`...). A server started as a shell loop (`sh -c 'while ...'`) keeps running.
 - Caches that store absolute paths in binary files (CMake, Gradle's configuration cache) or key on the folder path (Bazel, Xcode DerivedData) start cold in each copy.
 - Files that iCloud Drive or Dropbox hasn't downloaded can't be copied. Keep repos outside synced folders.
 

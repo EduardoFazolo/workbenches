@@ -7,10 +7,8 @@ mod common;
 
 use common::*;
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::symlink;
 use std::path::Path;
-use std::process::Stdio;
-use std::time::Duration;
 
 // ───────────────────────── Making a workbench ─────────────────────────
 
@@ -352,8 +350,7 @@ fn the_original_repo_is_never_written_to() {
     env.wb(&["ls"]).in_dir(&repo).succeeds();
     env.wb(&["env", "feat"]).in_dir(&repo).succeeds();
     fs::remove_file(wb.join("made-in-copy.txt")).unwrap();
-    fs::remove_file(wb.join("dirty.txt")).unwrap();
-    env.wb(&["rm", "feat"]).in_dir(&repo).succeeds();
+    fs::remove_dir_all(&wb).unwrap();
 
     assert_eq!(snapshot(&repo), before, "the original repo changed");
 }
@@ -1039,8 +1036,6 @@ fn every_command_refuses_an_unknown_workbench_name() {
         vec!["run", "ghost", "--", "true"],
         vec!["shell", "ghost"],
         vec!["land", "ghost"],
-        vec!["rm", "ghost"],
-        vec!["rm", "ghost"],
     ] {
         let out = env.wb(&args).in_dir(&repo).fails();
         assert!(out.mentions("ghost"), "should name what wasn't found\n{out}");
@@ -1054,7 +1049,7 @@ fn an_unknown_project_in_project_slash_name_is_reported_as_such() {
     let repo = env.repo("app");
     let real = env.new_workbench(&repo, "real");
 
-    let out = env.wb(&["rm", "nope/real"]).in_dir(&repo).fails();
+    let out = env.wb(&["path", "nope/real"]).in_dir(&repo).fails();
 
     assert!(out.mentions("nope"), "should say project 'nope' wasn't found, not that 'real' doesn't exist\n{out}");
     assert!(real.exists(), "app/real must not be touched");
@@ -1162,109 +1157,18 @@ fn new_refuses_a_full_copy_on_a_disk_without_copy_on_write_unless_asked() {
 // ───────────────────────── wb rm ─────────────────────────
 
 #[test]
-fn rm_deletes_a_clean_workbench_and_frees_its_name() {
+fn deleting_a_workbench_folder_removes_it_and_frees_its_name_and_ports() {
     let env = Env::new();
     let repo = env.repo("app");
     let wb = env.new_workbench(&repo, "feat");
+    let port = env.port_of(&repo, "feat");
 
-    env.wb(&["rm", "feat"]).in_dir(&repo).succeeds();
+    fs::remove_dir_all(&wb).unwrap();
 
-    assert!(!wb.exists());
-    env.wb(&["path", "feat"]).in_dir(&repo).fails();
     assert!(!env.wb(&["ls"]).in_dir(&repo).succeeds().stdout.contains("feat"));
+    env.wb(&["path", "feat"]).in_dir(&repo).fails();
     assert!(env.new_workbench(&repo, "feat").exists(), "the name can be reused");
-}
-
-#[test]
-fn rm_moves_unsaved_work_to_the_trash_and_says_what_it_had() {
-    let env = Env::new();
-    let repo = env.repo("app");
-    let wb = env.new_workbench(&repo, "feat");
-    env.commit(&wb, "work.txt", "committed, never pushed\n", "work");
-    write(&wb.join("README.md"), "edited\n");
-    env.git(&wb, &["stash", "-q"]);
-    write(&wb.join("notes.txt"), "untracked\n");
-
-    let out = env.wb(&["rm", "feat"]).in_dir(&repo).succeeds();
-
-    assert!(!wb.exists());
-    assert!(out.mentions("notes.txt"), "names the uncommitted file\n{out}");
-    assert!(out.mentions("stash"), "{out}");
-    assert!(out.mentions("branch feat"), "{out}");
-    let kept: Vec<_> = fs::read_dir(env.wb_home.join(".trash")).unwrap().flatten().collect();
-    assert_eq!(kept.len(), 1);
-    assert_eq!(read(&kept[0].path().join("notes.txt")), "untracked\n", "everything is recoverable from the trash");
-    assert_eq!(env.git(&kept[0].path(), &["log", "-1", "--format=%s", "feat"]), "work");
-}
-
-#[test]
-fn rm_keeps_the_workbench_when_the_trash_cant_take_it() {
-    let env = Env::new();
-    let repo = env.repo("app");
-    let wb = env.new_workbench(&repo, "feat");
-    let trash = env.wb_home.join(".trash");
-    fs::create_dir_all(&trash).unwrap();
-    fs::set_permissions(&trash, fs::Permissions::from_mode(0o555)).unwrap();
-    if fs::write(trash.join("probe"), "").is_ok() {
-        eprintln!("skipped: running as root, so a read-only folder can't be simulated");
-        return;
-    }
-
-    let out = env.wb(&["rm", "feat"]).in_dir(&repo).fails();
-    fs::set_permissions(&trash, fs::Permissions::from_mode(0o755)).unwrap();
-
-    assert!(wb.exists(), "nothing is deleted when it can't be kept\n{out}");
-    assert_eq!(env.path_of(&repo, "feat"), wb, "and it's still a workbench");
-}
-
-#[test]
-fn rm_keeps_the_deleted_copy_for_three_days() {
-    let env = Env::new();
-    let repo = env.repo("app");
-    let wb = env.new_workbench(&repo, "feat");
-    write(&wb.join("scratch.txt"), "notes\n");
-
-    let out = env.wb(&["rm", "feat"]).in_dir(&repo).succeeds();
-
-    assert!(!wb.exists());
-    assert!(out.mentions("3 days"), "rm says where the copy went\n{out}");
-    std::thread::sleep(Duration::from_millis(500)); // give the background purge its chance
-    let kept: Vec<_> = fs::read_dir(env.wb_home.join(".trash")).unwrap().flatten().collect();
-    assert_eq!(kept.len(), 1, "the deleted copy is kept");
-    assert_eq!(read(&kept[0].path().join("scratch.txt")), "notes\n");
-}
-
-#[test]
-fn rm_allows_after_pushing() {
-    let env = Env::new();
-    let repo = env.repo("app");
-    env.remote(&repo, "origin", "remote");
-    let wb = env.new_workbench(&repo, "feat");
-    env.commit(&wb, "a.txt", "a\n", "work");
-    env.git(&wb, &["push", "-q", "-u", "origin", "feat"]);
-
-    env.wb(&["rm", "feat"]).in_dir(&repo).succeeds();
-
-    assert!(!wb.exists());
-}
-
-#[test]
-fn rm_stops_processes_inside_but_leaves_shells_open() {
-    let env = Env::new();
-    let repo = env.repo("app");
-    let wb = env.new_workbench(&repo, "feat");
-    let mut guard = Cleanup::new(&env, &repo);
-    let worker = env.command("python3").args(["-c", "import time; time.sleep(120)"]).current_dir(&wb).spawn().unwrap();
-    let shell = env.command("/bin/sh").current_dir(&wb).stdin(Stdio::piped()).spawn().unwrap();
-    guard.children.push(worker);
-    guard.children.push(shell);
-    std::thread::sleep(Duration::from_millis(300));
-
-    env.wb(&["rm", "feat"]).in_dir(&repo).succeeds();
-
-    assert!(eventually(5, || exited(&mut guard.children[0])), "the process inside was not stopped");
-    assert!(!exited(&mut guard.children[1]), "the shell cd'd into the workbench was closed");
-    assert!(!wb.exists());
+    assert_eq!(env.port_of(&repo, "feat"), port, "and so can its ports");
 }
 
 // ───────────────────────── Servers ─────────────────────────
@@ -1280,8 +1184,7 @@ fn two_workbenches_serve_next_to_the_original_on_their_own_ports() {
     let wb_b = env.new_workbench(&repo, "b");
     write(&wb_a.join("id.txt"), "copy a");
     write(&wb_b.join("id.txt"), "copy b");
-    let mut guard = Cleanup::new(&env, &repo);
-    guard.workbenches = vec!["a".into(), "b".into()];
+    let mut guard = Cleanup::new();
 
     let main_port = free_port();
     guard.children.push(
@@ -1308,24 +1211,6 @@ fn two_workbenches_serve_next_to_the_original_on_their_own_ports() {
     assert!(ls.stdout.contains(&format!("serving :{pb}")), "{ls}");
 }
 
-#[test]
-fn rm_stops_a_running_dev_server() {
-    let _ports = serialize_ports();
-    let env = Env::new();
-    let repo = env.repo("app");
-    env.new_workbench(&repo, "srv");
-    let mut guard = Cleanup::new(&env, &repo);
-    guard.workbenches = vec!["srv".into()];
-    guard.children.push(env.wb(&["run", "srv", "--", "python3", "-c", PY_SERVER]).in_dir(&repo).spawn());
-    let port = env.port_of(&repo, "srv");
-    assert!(eventually(15, || listening(port)), "server didn't start on {port}");
-
-    env.wb(&["rm", "srv"]).in_dir(&repo).succeeds();
-
-    assert!(eventually(5, || !listening(port)), "server still answering on {port}");
-    assert!(eventually(5, || exited(&mut guard.children[0])), "`wb run` should end when its server is stopped");
-}
-
 // ───────────────────────── Things disappearing ─────────────────────────
 
 #[test]
@@ -1340,7 +1225,6 @@ fn a_workbench_folder_deleted_by_hand_does_not_break_wb() {
     env.wb(&["env", "feat"]).in_dir(&repo).run().assert_no_crash();
     env.wb(&["run", "feat", "--", "true"]).in_dir(&repo).run().assert_no_crash();
     env.wb(&["land", "feat"]).in_dir(&repo).run().assert_no_crash();
-    env.wb(&["rm", "feat"]).in_dir(&repo).run().assert_no_crash();
 
     let again = env.new_workbench(&repo, "feat");
     assert_eq!(env.branch(&again), "feat");
@@ -1357,10 +1241,8 @@ fn a_deleted_original_repo_does_not_break_wb() {
     env.wb(&["ls"]).in_dir(&nowhere).run().assert_no_crash();
     env.wb(&["path", "feat"]).in_dir(&nowhere).run().assert_no_crash();
     env.wb(&["land", "feat"]).in_dir(&nowhere).fails();
-    env.wb(&["rm", "feat"]).in_dir(&nowhere).run().assert_no_crash();
-    env.wb(&["rm", "feat"]).in_dir(&nowhere).run().assert_no_crash();
 
-    assert!(!wb.exists(), "rm should still remove the workbench");
+    assert_eq!(env.path_of(&nowhere, "feat"), wb, "the copy still works without its original");
 }
 
 // ───────────────────────── The CLI ─────────────────────────

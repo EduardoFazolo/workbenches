@@ -133,7 +133,7 @@ pub fn fix_clone(src_repo: &Path, dst_repo: &Path, branch: &str) -> Result<Vec<S
 
     // The original's worktree list: makes branches look "already checked out"
     // and lets `git worktree repair` in the copy rewire the original.
-    match remove_dir_all::remove_dir_all(gd.join("worktrees")) {
+    match fs::remove_dir_all(gd.join("worktrees")) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
             return Err(e).context("removing the original's worktree list from the copy");
         }
@@ -193,33 +193,6 @@ pub fn fix_clone(src_repo: &Path, dst_repo: &Path, branch: &str) -> Result<Vec<S
         run(dst_repo, args).with_context(|| format!("switching the copy to branch '{branch}'"))?;
     }
     Ok(notes)
-}
-
-/// What in `repo` isn't saved anywhere else, for a heads-up before it goes to
-/// the trash: changed files, stash entries, and branches with commits no remote
-/// has. Best effort: it informs, it never blocks.
-pub fn not_saved(repo: &Path) -> Vec<String> {
-    let mut notes = Vec::new();
-    let Some(status) = out(repo, &["status", "--porcelain"]) else {
-        return vec!["(git couldn't read this repo, so check the trash copy yourself)".into()];
-    };
-    let files: Vec<&str> = status.lines().map(|l| l.get(3..).unwrap_or(l)).collect();
-    if !files.is_empty() {
-        let more = files.len().saturating_sub(5);
-        let more = if more > 0 { format!(" (+{more} more)") } else { String::new() };
-        notes.push(format!("uncommitted: {}{more}", files[..files.len().min(5)].join(", ")));
-    }
-    let stashes = out(repo, &["stash", "list"]).map(|s| s.lines().count()).unwrap_or(0);
-    if stashes > 0 {
-        notes.push(format!("{stashes} stash entr{}", if stashes == 1 { "y" } else { "ies" }));
-    }
-    for branch in out(repo, &["for-each-ref", "--format=%(refname:short)", "refs/heads"]).unwrap_or_default().lines() {
-        let ahead = out(repo, &["rev-list", "--count", branch, "--not", "--remotes"]).unwrap_or_default();
-        if ahead.parse::<u32>().is_ok_and(|n| n > 0) {
-            notes.push(format!("branch {branch}: {ahead} commit(s) not on any remote"));
-        }
-    }
-    notes
 }
 
 #[cfg(unix)]

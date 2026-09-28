@@ -9,7 +9,6 @@ use crate::util::{canonical, fnv32};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -29,13 +28,25 @@ pub struct Bench {
     /// First port of this bench's block of `PORT_BLOCK`.
     pub port: u16,
     pub created: u64,
-    /// Name and ports are claimed, but `wb new` hasn't finished the copy (or
-    /// was interrupted). Only `wb rm` touches it.
+    /// Name and ports are claimed, but `wb new` hasn't finished the copy.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub creating: bool,
 }
 
+/// A creation this old was interrupted, not slow.
+const ABANDONED_AFTER_SECS: u64 = 60 * 60;
+
 impl Bench {
+    /// Deleting a workbench's folder is how you remove it, so a record only
+    /// counts while its folder exists, or while its creation is under way.
+    pub fn is_live(&self) -> bool {
+        if self.creating {
+            crate::util::now_secs().saturating_sub(self.created) < ABANDONED_AFTER_SECS
+        } else {
+            self.path.exists()
+        }
+    }
+
     pub fn env(&self) -> Vec<(String, String)> {
         vec![
             ("WB_NAME".into(), self.name.clone()),
@@ -92,7 +103,8 @@ pub fn lock() -> Result<Lock> {
     Ok(Lock(f))
 }
 
-/// Every workbench we know about. Unreadable metadata is reported, not hidden.
+/// Every live workbench (see `Bench::is_live`). Unreadable metadata is
+/// reported, not hidden.
 pub fn load_all() -> Vec<Bench> {
     let mut out = Vec::new();
     let Ok(projects) = fs::read_dir(home()) else { return out };
@@ -106,7 +118,8 @@ pub fn load_all() -> Vec<Bench> {
             let parsed =
                 fs::read(&path).map_err(anyhow::Error::from).and_then(|d| Ok(serde_json::from_slice::<Bench>(&d)?));
             match parsed {
-                Ok(b) => out.push(b),
+                Ok(b) if b.is_live() => out.push(b),
+                Ok(_) => {}
                 Err(e) => eprintln!("wb: skipping unreadable {}: {e:#}", path.display()),
             }
         }
@@ -115,37 +128,28 @@ pub fn load_all() -> Vec<Bench> {
     out
 }
 
-/// `create_new` claims a new name and fails if it's taken; otherwise the record
-/// is replaced.
-pub fn save(b: &Bench, create_new: bool) -> Result<()> {
+/// Records `b`, replacing whatever was recorded under its name. The write is
+/// atomic: a crash can't leave half a file. Call under `lock()`.
+pub fn save(b: &Bench) -> Result<()> {
     let p = meta_path(&b.project, &b.name);
     fs::create_dir_all(p.parent().unwrap())?;
-    let json = serde_json::to_vec_pretty(b)?;
-    if create_new {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&p)
-            .with_context(|| format!("workbench '{}' already exists", b.name))?;
-        f.write_all(&json)?;
-    } else {
-        // Replace it whole: a crash mid-write must not leave half a file.
-        let tmp = p.with_extension("json.tmp");
-        fs::write(&tmp, json)?;
-        fs::rename(&tmp, &p)?;
-    }
+    let tmp = p.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_vec_pretty(b)?)?;
+    fs::rename(&tmp, &p)?;
     Ok(())
 }
 
-pub fn delete(b: &Bench) -> Result<()> {
-    let _lock = lock()?;
-    remove_record(b)
+/// Whether a live workbench already has this name. Call under `lock()`.
+pub fn taken(project: &str, name: &str) -> bool {
+    fs::read(meta_path(project, name))
+        .ok()
+        .and_then(|d| serde_json::from_slice::<Bench>(&d).ok())
+        .is_some_and(|b| b.is_live())
 }
 
 /// Undoes a `wb new` that failed partway: runs `undo` and removes the record,
-/// but only if the record is still this same unfinished creation. Meanwhile
-/// `wb rm` may have removed it and someone may have made a new workbench with
-/// the same name, which must not be touched.
+/// but only if the record is still this same unfinished creation. If someone
+/// made a new workbench with the same name meanwhile, it must not be touched.
 pub fn abandon(b: &Bench, undo: impl FnOnce() -> Result<()>) -> Result<()> {
     let _lock = lock()?;
     let ours = fs::read(meta_path(&b.project, &b.name))
@@ -160,23 +164,10 @@ pub fn abandon(b: &Bench, undo: impl FnOnce() -> Result<()>) -> Result<()> {
 }
 
 fn remove_record(b: &Bench) -> Result<()> {
-    let meta = meta_path(&b.project, &b.name);
-    match fs::remove_file(&meta) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-            return Err(e).with_context(|| format!("removing {}", meta.display()));
-        }
-        _ => {}
+    match fs::remove_file(meta_path(&b.project, &b.name)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
     }
-    // Drop the project folder once its last bench is gone.
-    let proj = home().join(&b.project);
-    let any_left = fs::read_dir(proj.join(".meta"))
-        .map(|rd| rd.flatten().any(|e| e.path().extension().is_some_and(|x| x == "json")))
-        .unwrap_or(false);
-    let only_meta = fs::read_dir(&proj).map(|rd| rd.flatten().all(|e| e.file_name() == ".meta")).unwrap_or(false);
-    if !any_left && only_meta {
-        let _ = remove_dir_all::remove_dir_all(&proj);
-    }
-    Ok(())
 }
 
 pub fn validate_name(name: &str) -> Result<()> {
@@ -284,6 +275,20 @@ mod tests {
             assert!(names[i + 1..].iter().all(|b| b != a), "{a} collides");
         }
         assert!(bench("-app", "x").compose_project().starts_with("app-x-"));
+    }
+
+    #[test]
+    fn a_record_counts_while_its_folder_exists_or_its_creation_is_recent() {
+        let now = crate::util::now_secs();
+        let dir = std::env::temp_dir();
+        assert!(Bench { path: dir.clone(), ..bench("app", "a") }.is_live());
+        assert!(
+            !Bench { path: dir.join("no-such-folder-wb"), ..bench("app", "a") }.is_live(),
+            "folder deleted by hand"
+        );
+        let creating = Bench { creating: true, created: now, path: dir.join("no-such-folder-wb"), ..bench("app", "a") };
+        assert!(creating.is_live(), "copy under way");
+        assert!(!Bench { created: now - 2 * ABANDONED_AFTER_SECS, ..creating }.is_live(), "interrupted long ago");
     }
 
     #[test]

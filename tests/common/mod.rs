@@ -343,25 +343,20 @@ pub const PY_SERVER: &str = "import os, socketserver as s, http.server as h\n\
 class Server(s.ThreadingMixIn, s.TCPServer):\n    allow_reuse_address = True\n\
 Server(('127.0.0.1', int(os.environ['PORT'])), h.SimpleHTTPRequestHandler).serve_forever()";
 
-/// Kills background processes and force-removes workbenches when a test ends, even on failure.
-pub struct Cleanup<'a> {
-    pub env: &'a Env,
-    pub from: PathBuf,
-    pub workbenches: Vec<String>,
+/// Kills the background processes a test started when it ends, even on failure.
+/// The sandbox's temp folder takes the files with it.
+pub struct Cleanup {
     pub children: Vec<Child>,
 }
 
-impl<'a> Cleanup<'a> {
-    pub fn new(env: &'a Env, from: &Path) -> Self {
-        Cleanup { env, from: from.to_path_buf(), workbenches: vec![], children: vec![] }
+impl Cleanup {
+    pub fn new() -> Self {
+        Cleanup { children: vec![] }
     }
 }
 
-impl Drop for Cleanup<'_> {
+impl Drop for Cleanup {
     fn drop(&mut self) {
-        for name in &self.workbenches {
-            let _ = self.env.wb(&["rm", name]).in_dir(&self.from).run();
-        }
         for c in &mut self.children {
             let _ = c.kill();
             let _ = c.wait();

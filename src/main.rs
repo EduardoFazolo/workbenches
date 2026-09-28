@@ -1,6 +1,5 @@
 mod clone;
 mod gitfix;
-mod procs;
 mod registry;
 mod relocate;
 mod util;
@@ -25,7 +24,7 @@ Typical flow:
   wb new login-fix                   copy this repo; branch login-fix; ports 3100-3109
   wb run login-fix -- npm run dev    run it with PORT=3100
   wb land login-fix                  bring its commits back into this repo
-  wb rm login-fix                    stop it and delete it
+  rm -rf \"$(wb path login-fix)\"      delete it when you're done (stop its servers first)
 
 Environment: WB_HOME (where copies live, default ~/.workbenches), WB_COPY=1 (same as --copy).
 Details: https://github.com/EduardoFazolo/workbenches. `wb --agents` prints a guide for AI coding agents.",
@@ -65,24 +64,11 @@ Examples:
         no_setup: bool,
     },
 
-    /// List this repo's workbenches: branch, port, what's running, changes
+    /// List this repo's workbenches: branch, port, what's serving, changes
     Ls {
         /// Every repo's workbenches
         #[arg(short, long)]
         all: bool,
-    },
-
-    /// Stop what runs inside a workbench and move it to the trash (kept 3 days)
-    #[command(after_help = "\
-wb rm doesn't check your work for you; it lists what isn't saved anywhere else,
-and the copy stays in ~/.workbenches/.trash for 3 days. Before removing:
-  1. git status in the workbench: commit real work; generated files can go
-  2. push the branch, or wb land it
-  3. wb rm <name>
-To get a removed copy back, move its folder out of the trash.")]
-    Rm {
-        #[arg(help = NAME_HELP)]
-        name: String,
     },
 
     /// Print a workbench's folder
@@ -126,10 +112,6 @@ to put $PORT in its arguments.")]
         #[arg(help = NAME_HELP)]
         name: String,
     },
-
-    /// (internal) delete trashed workbenches in the background
-    #[command(name = "__purge", hide = true)]
-    Purge,
 }
 
 const AGENTS_GUIDE: &str = include_str!("agents.md");
@@ -148,16 +130,11 @@ fn main() -> ExitCode {
     let r = match cmd {
         Cmd::New { name, branch, from, copy, no_setup } => cmd_new(&name, branch, from, copy, no_setup),
         Cmd::Ls { all } => cmd_ls(all),
-        Cmd::Rm { name } => cmd_rm(&name),
         Cmd::Path { name } => resolve_ready(&name).map(|b| println!("{}", b.path.display())),
         Cmd::Run { name, cmd } => return cmd_run(&name, &cmd),
         Cmd::Shell { name } => return cmd_shell(&name),
         Cmd::Env { name } => cmd_env(&name),
         Cmd::Land { name } => cmd_land(&name),
-        Cmd::Purge => {
-            purge_trash();
-            Ok(())
-        }
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,
@@ -203,7 +180,7 @@ fn cmd_new(name: &str, branch: Option<String>, from: Option<PathBuf>, allow_copy
         let _lock = registry::lock()?;
         let project = registry::project_for(&root)?;
         let path = home.join(&project).join(name);
-        if path.exists() {
+        if path.exists() || registry::taken(&project, name) {
             bail!("workbench '{name}' already exists at {}", tilde(&path));
         }
         let taken: Vec<u16> = registry::load_all().iter().map(|b| b.port).collect();
@@ -217,17 +194,23 @@ fn cmd_new(name: &str, branch: Option<String>, from: Option<PathBuf>, allow_copy
             created: util::now_secs(),
             creating: true,
         };
-        registry::save(&bench, true)?;
+        registry::save(&bench)?;
         bench
     };
 
     if let Err(e) = build(&bench, allow_copy) {
-        // The half-made copy goes to the trash like any other, never deleted.
-        let _ = registry::abandon(&bench, || if bench.path.exists() { trash(&bench).map(|_| ()) } else { Ok(()) });
+        // Remove the half-made copy, but only if it's still this attempt's.
+        let _ = registry::abandon(&bench, || match fs::remove_dir_all(&bench.path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        });
         return Err(e);
     }
     let bench = Bench { creating: false, ..bench };
-    registry::save(&bench, false)?;
+    {
+        let _lock = registry::lock()?;
+        registry::save(&bench)?;
+    }
     if !no_setup {
         run_setup(&bench);
     }
@@ -369,7 +352,7 @@ fn resolve(input: &str) -> Result<Bench> {
 fn resolve_ready(input: &str) -> Result<Bench> {
     let b = resolve(input)?;
     if b.creating {
-        bail!("'{}' is still being created. If `wb new` was interrupted, remove it with: wb rm {}", b.name, b.name);
+        bail!("'{}' is still being created", b.name);
     }
     Ok(b)
 }
@@ -396,7 +379,6 @@ fn cmd_ls(all: bool) -> Result<()> {
         println!("no workbenches{}. Make one with: wb new <name>", if cur.is_some() { " for this repo" } else { "" });
         return Ok(());
     }
-    let sys = procs::snapshot();
     let rows: Vec<[String; 6]> = benches
         .iter()
         .map(|b| {
@@ -410,14 +392,11 @@ fn cmd_ls(all: bool) -> Result<()> {
             };
             let changed = gitfix::out(&b.path, &["status", "--porcelain"]).map(|s| s.lines().count());
             let listening: Vec<u16> = (b.port..b.port + PORT_BLOCK).filter(|&p| registry::port_listening(p)).collect();
-            let nprocs = procs::inside(&sys, &canonical(&b.path)).len();
             let status = if b.creating {
                 "creating".into()
             } else if !listening.is_empty() {
                 let ports: Vec<String> = listening.iter().map(|p| format!(":{p}")).collect();
                 format!("serving {}", ports.join(" "))
-            } else if nprocs > 0 {
-                format!("{nprocs} process{}", if nprocs == 1 { "" } else { "es" })
             } else {
                 "idle".into()
             };
@@ -446,97 +425,6 @@ fn cmd_ls(all: bool) -> Result<()> {
         line([&r[0], &r[1], &r[2], &r[3], &r[4], &r[5]]);
     }
     Ok(())
-}
-
-// ---------------------------------------------------------------- rm
-
-fn cmd_rm(name: &str) -> Result<()> {
-    let b = resolve(name)?;
-    if !b.path.exists() {
-        registry::delete(&b)?;
-        println!("✓ removed {} (its folder was already gone)", b.name);
-        return Ok(());
-    }
-    let procs::Stopped { stopped, shells } = procs::stop_inside(&canonical(&b.path));
-    if stopped > 0 {
-        println!("  stopped {stopped} process{}", if stopped == 1 { "" } else { "es" });
-    }
-    if shells > 0 {
-        println!("  note: {shells} shell(s) had their working directory inside it; cd them elsewhere");
-    }
-    // Background git helpers that would outlive the folder.
-    let _ = gitfix::git(&b.path).args(["fsmonitor--daemon", "stop"]).output();
-    let _ = gitfix::git(&b.path).args(["maintenance", "unregister", "--force"]).output();
-    if has_compose_file(&b.path) {
-        println!(
-            "  note: if you started docker compose here, stop it with: docker compose -p {} down",
-            b.compose_project()
-        );
-    }
-    // After stopping, so files written while shutting down are counted.
-    let unsaved = gitfix::not_saved(&b.path);
-    let cwd_inside = std::env::current_dir().is_ok_and(|c| canonical(&c).starts_with(canonical(&b.path)));
-    let kept = trash(&b)?;
-    registry::delete(&b)?;
-    println!("✓ removed {}, kept in {} for 3 days", b.name, tilde(&kept));
-    if !unsaved.is_empty() {
-        println!("  it had work not saved anywhere else:");
-        for u in unsaved {
-            println!("    {u}");
-        }
-        println!("  to get it back: mv \"{}\" <somewhere>", kept.display());
-    }
-    if cwd_inside {
-        println!("  (your shell was inside it; cd somewhere else)");
-    }
-    Ok(())
-}
-
-/// How long removed workbenches stay in the trash. `wb rm` doesn't block on
-/// unsaved work; this is the safety net. Three days covers a weekend.
-const TRASH_KEEP_SECS: u64 = 3 * 24 * 60 * 60;
-
-/// Moves the workbench into ~/.workbenches/.trash and returns where it went. A
-/// detached `wb __purge` deletes whatever has been there longer than
-/// `TRASH_KEEP_SECS`. If the move fails, nothing is deleted.
-fn trash(b: &Bench) -> Result<PathBuf> {
-    let bin = registry::home().join(".trash");
-    fs::create_dir_all(&bin)?;
-    let dest = bin.join(format!("{}-{}-{}-{}", b.project, b.name, std::process::id(), util::now_secs()));
-    fs::rename(&b.path, &dest)
-        .with_context(|| format!("couldn't move {} to the trash, so nothing was deleted", tilde(&b.path)))?;
-    if let Ok(exe) = std::env::current_exe() {
-        let mut c = Command::new(exe);
-        c.arg("__purge")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            c.process_group(0); // survive the terminal closing
-        }
-        let _ = c.spawn();
-    }
-    Ok(dest)
-}
-
-/// Deletes trashed workbenches older than `TRASH_KEEP_SECS`. Each folder name
-/// ends in the unix time it was trashed.
-fn purge_trash() {
-    let Ok(rd) = fs::read_dir(registry::home().join(".trash")) else { return };
-    let now = util::now_secs();
-    for e in rd.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        let trashed = name.rsplit('-').next().and_then(|t| t.parse::<u64>().ok()).unwrap_or(0);
-        if now.saturating_sub(trashed) >= TRASH_KEEP_SECS {
-            let _ = remove_dir_all::remove_dir_all(e.path());
-        }
-    }
-}
-
-fn has_compose_file(dir: &Path) -> bool {
-    ["compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml"].iter().any(|f| dir.join(f).exists())
 }
 
 // ---------------------------------------------------------------- run / shell / env
