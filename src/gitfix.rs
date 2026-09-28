@@ -58,18 +58,22 @@ pub fn run(dir: &Path, args: &[&str]) -> Result<String> {
 }
 
 fn run_with_input(dir: &Path, args: &[&str], input: &str) -> Result<String> {
-    let mut child = git(dir)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("running git (is it installed?)")?;
-    let mut stdin = child.stdin.take().expect("stdin is piped");
-    let input = input.to_string();
-    let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+    let mut cmd = git(dir);
+    // Never wait on a username/password prompt nobody will answer.
+    cmd.args(args).env("GIT_TERMINAL_PROMPT", "0").stdout(Stdio::piped()).stderr(Stdio::piped());
+    if !input.is_empty() {
+        cmd.stdin(Stdio::piped());
+    }
+    let mut child = cmd.spawn().context("running git (is it installed?)")?;
+    // Feed stdin from a thread: git may fill its stdout pipe before reading it all.
+    let writer = child.stdin.take().map(|mut stdin| {
+        let input = input.to_string();
+        std::thread::spawn(move || stdin.write_all(input.as_bytes()))
+    });
     let o = child.wait_with_output()?;
-    let _ = writer.join();
+    if let Some(w) = writer {
+        let _ = w.join();
+    }
     if !o.status.success() {
         bail!("git {} in {}: {}", args.join(" "), dir.display(), String::from_utf8_lossy(&o.stderr).trim());
     }
@@ -147,6 +151,7 @@ pub fn fix_clone(src_repo: &Path, dst_repo: &Path, branch: &str) -> Result<Vec<S
         _ => {}
     }
 
+    let mut borrowing = Vec::new();
     for e in WalkDir::new(&gd).into_iter().filter_map(Result::ok) {
         let name = e.file_name().to_string_lossy();
         let path = e.path();
@@ -177,7 +182,18 @@ pub fn fix_clone(src_repo: &Path, dst_repo: &Path, branch: &str) -> Result<Vec<S
                     .collect();
                 fs::write(path, fixed.join("\n") + "\n")?;
             }
+            borrowing.push(path.to_path_buf());
         }
+    }
+
+    // A repo made with `clone --shared` or `--reference` borrows objects from
+    // another repo, and would break the day that repo moves. Copy the borrowed
+    // objects in and drop the link. `-a` packs borrowed objects too.
+    for alternates in borrowing {
+        let Some(git_dir) = alternates.parent().and_then(Path::parent).and_then(Path::parent) else { continue };
+        run(git_dir, &["repack", "-a", "-d", "-q"]).context("copying objects this repo borrows from another")?;
+        fs::remove_file(&alternates)?;
+        notes.push("copied in the objects it borrowed from another repo (clone --shared/--reference)".into());
     }
 
     // Remotes like `../other-repo` now point somewhere else.
@@ -330,6 +346,11 @@ pub fn unsaved_work(dst: &Path, src: &Path, since: u64) -> Result<Vec<String>> {
     }
 
     let unsaved = not_in_source(src, &tips.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>())?;
+    if !unsaved.is_empty() && !run(dst, &["remote"])?.is_empty() {
+        // Remote-tracking refs can be stale (a branch deleted on the remote since
+        // the push). Only what the remotes have right now counts.
+        run(dst, &["fetch", "--all", "--prune", "--no-tags", "--quiet"]).context("checking the remotes")?;
+    }
     let mut labels: Vec<&str> = Vec::new();
     for (sha, what) in &tips {
         if unsaved.contains(sha) && !labels.contains(&what.as_str()) && !on_a_remote(dst, sha)? {

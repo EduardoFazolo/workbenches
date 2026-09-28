@@ -29,6 +29,10 @@ pub struct Bench {
     /// First port of this bench's block of `PORT_BLOCK`.
     pub port: u16,
     pub created: u64,
+    /// Name and ports are claimed, but `wb new` hasn't finished the copy (or
+    /// was interrupted). Only `wb rm` touches it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub creating: bool,
 }
 
 impl Bench {
@@ -45,17 +49,13 @@ impl Bench {
         ]
     }
 
-    /// Compose only allows `[a-z0-9_-]`, starting with a letter or digit. When
-    /// that loses information (`fix.a` and `fix-a` would both be `app-fix-a`),
-    /// a hash of the real identity keeps the two apart.
+    /// Compose only allows `[a-z0-9_-]`, starting with a letter or digit, and
+    /// `<project>-<name>` alone is ambiguous (`a-b`/`c` vs `a`/`b-c`), so a hash
+    /// of the real identity always follows the readable part.
     pub fn compose_project(&self) -> String {
-        let id = format!("{}-{}", self.project, self.name);
-        let clean = sanitize(&id).to_lowercase().trim_start_matches(['-', '_']).to_string();
-        if clean == id {
-            clean
-        } else {
-            format!("{clean}-{:08x}", fnv32(format!("{}/{}", self.project, self.name).as_bytes()))
-        }
+        let readable = sanitize(&format!("{}-{}", self.project, self.name)).to_lowercase();
+        let readable = readable.trim_start_matches(['-', '_']);
+        format!("{readable}-{:08x}", fnv32(format!("{}/{}", self.project, self.name).as_bytes()))
     }
 }
 
@@ -115,7 +115,8 @@ pub fn load_all() -> Vec<Bench> {
     out
 }
 
-/// `create_new` doubles as a lock: two `wb new x` racing can't both win.
+/// `create_new` claims a new name and fails if it's taken; otherwise the record
+/// is replaced.
 pub fn save(b: &Bench, create_new: bool) -> Result<()> {
     let p = meta_path(&b.project, &b.name);
     fs::create_dir_all(p.parent().unwrap())?;
@@ -128,7 +129,10 @@ pub fn save(b: &Bench, create_new: bool) -> Result<()> {
             .with_context(|| format!("workbench '{}' already exists", b.name))?;
         f.write_all(&json)?;
     } else {
-        fs::write(&p, json)?;
+        // Replace it whole: a crash mid-write must not leave half a file.
+        let tmp = p.with_extension("json.tmp");
+        fs::write(&tmp, json)?;
+        fs::rename(&tmp, &p)?;
     }
     Ok(())
 }
@@ -232,6 +236,7 @@ mod tests {
             branch: name.into(),
             port: PORT_START,
             created: 0,
+            creating: false,
         }
     }
 
@@ -246,12 +251,17 @@ mod tests {
     }
 
     #[test]
-    fn compose_names_never_collide() {
-        assert_eq!(bench("app", "fix-a").compose_project(), "app-fix-a");
-        let dotted = bench("app", "fix.a").compose_project();
-        assert_ne!(dotted, "app-fix-a");
-        assert!(dotted.starts_with("app-fix-a-"));
-        assert_ne!(bench("App", "x").compose_project(), bench("app", "x").compose_project());
+    fn compose_names_are_readable_valid_and_distinct() {
+        let names =
+            [bench("app", "fix-a"), bench("app", "fix.a"), bench("App", "fix-a"), bench("a-b", "c"), bench("a", "b-c")]
+                .map(|b| b.compose_project());
+        assert!(names[0].starts_with("app-fix-a-"));
+        for n in &names {
+            assert!(n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_'), "{n}");
+        }
+        for (i, a) in names.iter().enumerate() {
+            assert!(names[i + 1..].iter().all(|b| b != a), "{a} collides");
+        }
         assert!(bench("-app", "x").compose_project().starts_with("app-x-"));
     }
 

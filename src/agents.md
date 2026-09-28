@@ -45,7 +45,7 @@ When two repos have workbenches with the same name, use `project/name`. `wb ls -
 |---|---|---|
 | `PORT` / `WB_PORT` | `3100` | First port of this workbench's block. Use it for the main dev server. |
 | `WB_PORTS` | `3100-3109` | All 10 ports. Use `WB_PORT+1`, `+2`, ... for extra services (API, worker, storybook). |
-| `COMPOSE_PROJECT_NAME` | `myapp-fix-login` | Makes `docker compose` containers, networks and volumes separate |
+| `COMPOSE_PROJECT_NAME` | `myapp-fix-login-3f9a1c2e` | Makes `docker compose` containers, networks and volumes separate |
 | `WB_NAME` / `WB_PROJECT` | `fix-login` / `myapp` | Identity |
 | `WB_PATH` | | This workbench's folder |
 | `WB_SOURCE` | | The original repo. Read it for reference only; don't write to it. |
@@ -127,7 +127,7 @@ Files, git state and ports are isolated. External services are **shared** unless
 
 ## When `wb rm` refuses
 
-It lists what would be lost: uncommitted changes (untracked files included), or commits the original repo can't reach and no remote has, whether on a branch, a tag, in the stash, or only in the reflog (after a detached HEAD or a reset). Submodules are checked too. If it says it couldn't check, git failed: report the error to the user.
+It lists what would be lost: uncommitted changes (untracked files included), or commits the original repo can't reach and no remote has, whether on a branch, a tag, in the stash, or only in the reflog (after a detached HEAD or a reset). Submodules are checked too. A commit only counts as pushed if the remote has it right now, so `rm` may fetch first; if it can't reach a remote, or git fails, it refuses: report the error to the user. Deleted copies stay in `~/.workbenches/.trash` for a day.
 
 1. Commit what matters inside the workbench.
 2. Then `wb land <name>` or `git push`.
@@ -167,9 +167,10 @@ printf 'DATABASE_URL=postgres://localhost/myapp_%s\nPORT=%s\n' "$WB_NAME" "$WB_P
 
 - **The workbench starts as an exact copy** of the original, including its uncommitted changes and untracked files at that moment. Check `git status` in the workbench before committing, so you don't commit someone else's in-progress edits by accident.
 - **Same branch name, different branches.** A branch named `main` in the workbench and in the original are separate after the copy. Commits in one appear in the other only through `wb land`, fetch, push or pull.
+- **`creating` in `wb ls`** means a `wb new` is still copying, or was interrupted. Other commands refuse that workbench until it's ready. If it stays that way, ask the user before `wb rm <name> --force`.
 - **`origin` and your git identity came along,** so `git push` and commits work normally.
 - **Copies live in `~/.workbenches/<project>/<name>`** (or `$WB_HOME`). Nothing is written into the original repo.
-- **`wb rm` returns at once.** It moves the folder to a trash area and deletes it in the background.
+- **`wb rm` returns at once.** It moves the folder to `~/.workbenches/.trash`, where it's kept for a day before being deleted in the background.
 - **Installing packages in a workbench** (`npm install`, `pip install`) affects only that workbench.
 
 ## Install this guide as a skill

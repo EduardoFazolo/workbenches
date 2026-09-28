@@ -37,10 +37,32 @@ pub struct Stats {
     pub unlisted: Vec<String>,
 }
 
-type Pairs = Vec<(Vec<u8>, Vec<u8>)>;
+/// What to rewrite: every spelling of the original's path paired with the
+/// copy's, plus what can follow the original's name without being it.
+struct Paths {
+    pairs: Vec<(Vec<u8>, Vec<u8>)>,
+    /// With `app data` next to `app`, " data": text that continues into a
+    /// sibling's name is that sibling, not the original.
+    sibling_tails: Vec<Vec<u8>>,
+}
+
+fn paths(src: &Path, dst: &Path) -> Paths {
+    let src = canonical(src);
+    let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let sibling_tails = src
+        .parent()
+        .and_then(|p| fs::read_dir(p).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_string_lossy().strip_prefix(name.as_str()).map(|t| t.as_bytes().to_vec()))
+        .filter(|tail| !tail.is_empty())
+        .collect();
+    Paths { pairs: pairs(&src, dst), sibling_tails }
+}
 
 /// Every spelling of the old path we might find, paired with the new one.
-fn pairs(src: &Path, dst: &Path) -> Pairs {
+fn pairs(src: &Path, dst: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
     let trim = |p: &Path| p.to_string_lossy().trim_end_matches(['/', '\\']).to_string();
     let new = trim(&canonical(dst));
     let mut olds = vec![trim(src), trim(&canonical(src))];
@@ -53,7 +75,7 @@ fn pairs(src: &Path, dst: &Path) -> Pairs {
             olds.push(rest.to_string());
         }
     }
-    let mut out: Pairs = Vec::new();
+    let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut add = |a: String, b: String| {
         if !a.is_empty() && !out.iter().any(|(x, _)| x == a.as_bytes()) {
             out.push((a.into_bytes(), b.into_bytes()));
@@ -70,19 +92,22 @@ fn pairs(src: &Path, dst: &Path) -> Pairs {
     out
 }
 
+/// Bytes that continue a file name. Non-ASCII counts: `/src/app` isn't in `/src/appé`.
 fn is_path_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.') || b >= 0x80
 }
 
 /// Replace whole-path occurrences only: `/src/app` must not match inside
-/// `/src/app-old` or `/private/src/app`.
-fn replace_all(data: &[u8], pairs: &Pairs) -> Option<Vec<u8>> {
+/// `/src/app-old`, `/private/src/app` or a sibling folder `/src/app data`.
+fn replace_all(data: &[u8], paths: &Paths) -> Option<Vec<u8>> {
+    let pairs = &paths.pairs;
     let mut hits: Vec<(usize, usize, usize)> = Vec::new();
     for (i, (old, _)) in pairs.iter().enumerate() {
         for pos in memmem::find_iter(data, old) {
             let end = pos + old.len();
             let starts_clean = pos == 0 || !is_path_char(data[pos - 1]);
-            let ends_clean = end == data.len() || !is_path_char(data[end]);
+            let ends_clean = (end == data.len() || !is_path_char(data[end]))
+                && !paths.sibling_tails.iter().any(|tail| data[end..].starts_with(tail));
             if starts_clean && ends_clean {
                 hits.push((pos, old.len(), i));
             }
@@ -114,7 +139,7 @@ fn skip_dir(e: &walkdir::DirEntry) -> bool {
 }
 
 pub fn relocate(src: &Path, dst: &Path) -> Result<Stats> {
-    let pairs = pairs(src, dst);
+    let paths = paths(src, dst);
     let mut entries = Vec::new();
     let mut repos = Vec::new();
     for e in WalkDir::new(dst).follow_links(false).into_iter().filter_entry(|e| !skip_dir(e)) {
@@ -158,7 +183,7 @@ pub fn relocate(src: &Path, dst: &Path) -> Result<Stats> {
         let is_tracked = tracked.contains(&key);
         let ft = e.file_type();
         let result = if ft.is_symlink() {
-            relink(path, &pairs, is_tracked).map(|hit| match hit {
+            relink(path, &paths, is_tracked).map(|hit| match hit {
                 Hit::Changed => _ = links.fetch_add(1, Ordering::Relaxed),
                 Hit::Tracked => tracked_hits.lock().unwrap().push(key.clone()),
                 Hit::None => {}
@@ -171,7 +196,7 @@ pub fn relocate(src: &Path, dst: &Path) -> Result<Stats> {
                 fs::remove_file(path).map(|()| _ = removed.fetch_add(1, Ordering::Relaxed))
             }
         } else {
-            rewrite(path, e, &pairs, is_tracked).map(|hit| match hit {
+            rewrite(path, e, &paths, is_tracked).map(|hit| match hit {
                 Hit::Changed => _ = files.fetch_add(1, Ordering::Relaxed),
                 Hit::Tracked => tracked_hits.lock().unwrap().push(key.clone()),
                 Hit::None => {}
@@ -204,18 +229,22 @@ enum Hit {
     Tracked,
 }
 
-/// Point an absolute symlink at the copy. The new link is made next to the old
-/// one and renamed over it, so a failure never leaves the link missing.
-fn relink(path: &Path, pairs: &Pairs, is_tracked: bool) -> io::Result<Hit> {
+/// Point an absolute symlink into the original at the copy, matching whole path
+/// components. The new link is made next to the old one and renamed over it, so
+/// a failure never leaves the link missing.
+fn relink(path: &Path, paths: &Paths, is_tracked: bool) -> io::Result<Hit> {
     let target = fs::read_link(path)?;
-    if !target.is_absolute() {
+    let lossy = |b: &[u8]| PathBuf::from(String::from_utf8_lossy(b).into_owned());
+    let Some(new) = paths
+        .pairs
+        .iter()
+        .find_map(|(old, new)| target.strip_prefix(lossy(old)).ok().map(|rest| lossy(new).join(rest)))
+    else {
         return Ok(Hit::None);
-    }
-    let Some(new) = replace_all(target.to_string_lossy().as_bytes(), pairs) else { return Ok(Hit::None) };
+    };
     if is_tracked {
         return Ok(Hit::Tracked);
     }
-    let new = PathBuf::from(String::from_utf8_lossy(&new).into_owned());
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".wb-tmp");
     let tmp = PathBuf::from(tmp);
@@ -226,13 +255,13 @@ fn relink(path: &Path, pairs: &Pairs, is_tracked: bool) -> io::Result<Hit> {
 
 /// Replace the original's path in a small text file, keeping its mtime (so
 /// build tools don't see a change) and its permissions (even read-only ones).
-fn rewrite(path: &Path, e: &walkdir::DirEntry, pairs: &Pairs, is_tracked: bool) -> io::Result<Hit> {
+fn rewrite(path: &Path, e: &walkdir::DirEntry, paths: &Paths, is_tracked: bool) -> io::Result<Hit> {
     let md = e.metadata()?;
     if md.len() == 0 || md.len() > MAX_TEXT {
         return Ok(Hit::None);
     }
     let Some(data) = read_text(path, md.len())? else { return Ok(Hit::None) };
-    let Some(new) = replace_all(&data, pairs) else { return Ok(Hit::None) };
+    let Some(new) = replace_all(&data, paths) else { return Ok(Hit::None) };
     if is_tracked {
         return Ok(Hit::Tracked);
     }
@@ -282,8 +311,8 @@ fn is_runtime_leftover(key: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn p() -> Pairs {
-        vec![(b"/src/app".to_vec(), b"/wb/app/x".to_vec())]
+    fn p() -> Paths {
+        Paths { pairs: vec![(b"/src/app".to_vec(), b"/wb/app/x".to_vec())], sibling_tails: vec![b" data".to_vec()] }
     }
 
     #[test]
@@ -293,6 +322,9 @@ mod tests {
         assert!(replace_all(b"/src/app-old/x", &p()).is_none());
         assert!(replace_all(b"/private/src/app/x", &p()).is_none());
         assert_eq!(replace_all(b"\"/src/app\"", &p()).unwrap(), b"\"/wb/app/x\"");
+        assert!(replace_all("/src/appé/x".as_bytes(), &p()).is_none(), "non-ASCII continues the name");
+        assert!(replace_all(b"/src/app data/x", &p()).is_none(), "a sibling folder isn't the original");
+        assert_eq!(replace_all(b"cd /src/app && ls", &p()).unwrap(), b"cd /wb/app/x && ls");
     }
 
     #[test]

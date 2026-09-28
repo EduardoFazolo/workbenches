@@ -145,7 +145,7 @@ fn main() -> ExitCode {
         Cmd::New { name, branch, from, copy, no_setup } => cmd_new(&name, branch, from, copy, no_setup),
         Cmd::Ls { all } => cmd_ls(all),
         Cmd::Rm { name, force } => cmd_rm(&name, force),
-        Cmd::Path { name } => resolve(&name).map(|b| println!("{}", b.path.display())),
+        Cmd::Path { name } => resolve_ready(&name).map(|b| println!("{}", b.path.display())),
         Cmd::Run { name, cmd } => return cmd_run(&name, &cmd),
         Cmd::Shell { name } => return cmd_shell(&name),
         Cmd::Env { name } => cmd_env(&name),
@@ -211,6 +211,7 @@ fn cmd_new(name: &str, branch: Option<String>, from: Option<PathBuf>, allow_copy
             branch,
             port: registry::allocate_port(&taken)?,
             created: util::now_secs(),
+            creating: true,
         };
         registry::save(&bench, true)?;
         bench
@@ -221,6 +222,8 @@ fn cmd_new(name: &str, branch: Option<String>, from: Option<PathBuf>, allow_copy
         let _ = registry::delete(&bench);
         return Err(e);
     }
+    let bench = Bench { creating: false, ..bench };
+    registry::save(&bench, false)?;
     if !no_setup {
         run_setup(&bench);
     }
@@ -385,6 +388,19 @@ fn resolve(input: &str) -> Result<Bench> {
     }
 }
 
+/// `resolve`, for every command but `rm`: refuses a workbench still being created.
+fn resolve_ready(input: &str) -> Result<Bench> {
+    let b = resolve(input)?;
+    if b.creating {
+        bail!(
+            "'{}' is still being created. If `wb new` was interrupted, remove it with: wb rm {} --force",
+            b.name,
+            b.name
+        );
+    }
+    Ok(b)
+}
+
 fn current_project() -> Option<String> {
     let cwd = canonical(&std::env::current_dir().ok()?);
     let home = canonical(&registry::home());
@@ -422,7 +438,9 @@ fn cmd_ls(all: bool) -> Result<()> {
             let changed = gitfix::out(&b.path, &["status", "--porcelain"]).map(|s| s.lines().count());
             let listening: Vec<u16> = (b.port..b.port + PORT_BLOCK).filter(|&p| registry::port_listening(p)).collect();
             let nprocs = procs::inside(&sys, &canonical(&b.path)).len();
-            let status = if !listening.is_empty() {
+            let status = if b.creating {
+                "creating".into()
+            } else if !listening.is_empty() {
                 let ports: Vec<String> = listening.iter().map(|p| format!(":{p}")).collect();
                 format!("serving {}", ports.join(" "))
             } else if nprocs > 0 {
@@ -461,22 +479,11 @@ fn cmd_ls(all: bool) -> Result<()> {
 
 fn cmd_rm(name: &str, force: bool) -> Result<()> {
     let b = resolve(name)?;
-    if b.path.exists() && !force {
-        let problems = unsaved_work(&b).with_context(|| {
-            format!("couldn't check '{}' for unsaved work, so it wasn't deleted (--force deletes anyway)", b.name)
-        })?;
-        if !problems.is_empty() {
-            bail!(
-                "'{}' has work that would be lost:\n  - {}\nLand it (wb land {}), push it, or delete anyway with: wb rm {} --force",
-                b.name,
-                problems.join("\n  - "),
-                b.name,
-                b.name
-            );
-        }
-    }
-
     if b.path.exists() {
+        // Check before stopping anything, so a refusal leaves running servers alone...
+        if !force {
+            refuse_if_unsaved(&b, "")?;
+        }
         let dir = canonical(&b.path);
         let procs::Stopped { stopped, shells } = procs::stop_inside(&dir);
         if stopped > 0 {
@@ -484,6 +491,10 @@ fn cmd_rm(name: &str, force: bool) -> Result<()> {
         }
         if shells > 0 {
             println!("  note: {shells} shell(s) had their working directory inside it; cd them elsewhere");
+        }
+        // ...and again after, because a process can write files as it shuts down.
+        if !force && stopped > 0 {
+            refuse_if_unsaved(&b, "its processes changed files while stopping. ")?;
         }
         // Best effort: background git helpers that would outlive the folder.
         let _ = gitfix::git(&b.path).args(["fsmonitor--daemon", "stop"]).output();
@@ -506,17 +517,22 @@ fn cmd_rm(name: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
-/// Deleting 100k files takes seconds; renaming the folder is instant on every
-/// OS. So move it into ~/.workbenches/.trash and let a detached `wb __purge`
-/// delete it after we've returned.
+/// How long deleted workbenches stay in the trash: the safety checks can be
+/// wrong, and a day is enough to notice.
+const TRASH_KEEP_SECS: u64 = 24 * 60 * 60;
+
+/// Deleting 100k files takes seconds; renaming the folder is instant. So move it
+/// into ~/.workbenches/.trash and let a detached `wb __purge` delete whatever
+/// has been there longer than `TRASH_KEEP_SECS`.
 fn trash(b: &Bench) -> Result<()> {
     let bin = registry::home().join(".trash");
     fs::create_dir_all(&bin)?;
-    let dest = bin.join(format!("{}-{}-{}", b.project, b.name, std::process::id()));
+    let dest = bin.join(format!("{}-{}-{}-{}", b.project, b.name, std::process::id(), util::now_secs()));
     if fs::rename(&b.path, &dest).is_err() {
         // e.g. Windows with a file still open: fall back to deleting in place.
         return remove_dir_all::remove_dir_all(&b.path).with_context(|| format!("deleting {}", b.path.display()));
     }
+    println!("  kept in {} for a day, in case you need it back", tilde(&dest));
     if let Ok(exe) = std::env::current_exe() {
         let mut c = Command::new(exe);
         c.arg("__purge")
@@ -528,19 +544,39 @@ fn trash(b: &Bench) -> Result<()> {
             use std::os::unix::process::CommandExt;
             c.process_group(0); // survive the terminal closing
         }
-        if c.spawn().is_err() {
-            purge_trash();
-        }
+        let _ = c.spawn();
     }
     Ok(())
 }
 
+/// Deletes trashed workbenches older than `TRASH_KEEP_SECS`. Each folder name
+/// ends in the unix time it was trashed.
 fn purge_trash() {
-    if let Ok(rd) = fs::read_dir(registry::home().join(".trash")) {
-        for e in rd.flatten() {
+    let Ok(rd) = fs::read_dir(registry::home().join(".trash")) else { return };
+    let now = util::now_secs();
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let trashed = name.rsplit('-').next().and_then(|t| t.parse::<u64>().ok()).unwrap_or(0);
+        if now.saturating_sub(trashed) >= TRASH_KEEP_SECS {
             let _ = remove_dir_all::remove_dir_all(e.path());
         }
     }
+}
+
+fn refuse_if_unsaved(b: &Bench, why: &str) -> Result<()> {
+    let problems = unsaved_work(b).with_context(|| {
+        format!("couldn't check '{}' for unsaved work, so it wasn't deleted (--force deletes anyway)", b.name)
+    })?;
+    if !problems.is_empty() {
+        bail!(
+            "{why}'{}' has work that would be lost:\n  - {}\nLand it (wb land {}), push it, or delete anyway with: wb rm {} --force",
+            b.name,
+            problems.join("\n  - "),
+            b.name,
+            b.name
+        );
+    }
+    Ok(())
 }
 
 /// Everything `wb rm` would lose, in the workbench and its submodules.
@@ -579,7 +615,7 @@ fn hand_over(mut cmd: Command, what: &str) -> ExitCode {
 }
 
 fn cmd_run(name: &str, cmd: &[String]) -> ExitCode {
-    let b = match resolve(name) {
+    let b = match resolve_ready(name) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("wb: {e:#}");
@@ -601,7 +637,7 @@ fn cmd_run(name: &str, cmd: &[String]) -> ExitCode {
 }
 
 fn cmd_shell(name: &str) -> ExitCode {
-    let b = match resolve(name) {
+    let b = match resolve_ready(name) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("wb: {e:#}");
@@ -620,7 +656,7 @@ fn cmd_shell(name: &str) -> ExitCode {
 }
 
 fn cmd_env(name: &str) -> Result<()> {
-    let b = resolve(name)?;
+    let b = resolve_ready(name)?;
     for (k, v) in b.env() {
         if cfg!(windows) {
             println!("$env:{k}='{}'", v.replace('\'', "''"));
@@ -634,7 +670,7 @@ fn cmd_env(name: &str) -> Result<()> {
 // ---------------------------------------------------------------- land
 
 fn cmd_land(name: &str) -> Result<()> {
-    let b = resolve(name)?;
+    let b = resolve_ready(name)?;
     let (dst, src) = (&b.path, &b.source);
     let Some(branch) = gitfix::out(dst, &["branch", "--show-current"]).filter(|s| !s.is_empty()) else {
         bail!("the workbench isn't on a branch (detached HEAD); check one out first");

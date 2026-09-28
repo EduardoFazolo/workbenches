@@ -53,11 +53,11 @@ mkdir -p ~/.claude/skills/workbenches && wb --agents > ~/.claude/skills/workbenc
 |---|---|---|
 | `PORT`, `WB_PORT` | `3100` | First port of the copy's block of 10 |
 | `WB_PORTS` | `3100-3109` | The whole block, for extra services |
-| `COMPOSE_PROJECT_NAME` | `myapp-login-fix` | Keeps docker compose containers and volumes apart |
+| `COMPOSE_PROJECT_NAME` | `myapp-login-fix-3f9a1c2e` | Keeps docker compose containers and volumes apart |
 | `WB_NAME`, `WB_PROJECT` | `login-fix`, `myapp` | |
 | `WB_PATH`, `WB_SOURCE` | | The copy, and the original |
 
-`COMPOSE_PROJECT_NAME` is `<project>-<name>` when that's already a valid compose name. Otherwise it's cleaned up to one and gets a short hash, so `fix.a` and `fix-a` stay apart.
+`COMPOSE_PROJECT_NAME` is `<project>-<name>` cleaned up to what compose accepts, plus a short hash of the exact identity, so `fix.a` and `fix-a`, or project `a-b` with `c` and project `a` with `b-c`, never share containers.
 
 Settings: `WB_HOME` moves the copies (default `~/.workbenches`; keep it on the same disk as your repos, clones don't cross disks). `WB_COPY=1` is the same as `--copy`.
 
@@ -65,9 +65,11 @@ Settings: `WB_HOME` moves the copies (default `~/.workbenches`; keep it on the s
 
 1. **Refuses unsafe sources.** A linked worktree or submodule (the copy would share state with the original), a repo in the middle of a merge, rebase, cherry-pick or bisect, or one with a git command running.
 2. **Copies the folder.** One `clonefile` call on macOS, a reflink per file on Linux. On a disk without clones it refuses rather than silently using gigabytes; `--copy` does a real copy.
-3. **Makes the copied `.git` independent.** Drops the original's worktree list and stale lock files, fixes relative remotes and alternates, keeps your git identity (including one set by `includeIf "gitdir:..."`), and switches to the branch.
-4. **Rewrites leftover paths.** Untracked text files that contain the original folder's path get the copy's path instead: Python venv scripts (otherwise `pip` installs into the original's venv), pnpm shims, git hooks, absolute symlinks. Committed files are never changed, only listed, including committed symlinks and files in submodules. Binary files are skipped. Pid and lock files left by processes running in the original are removed.
+3. **Makes the copied `.git` independent.** Drops the original's worktree list and stale lock files, fixes relative remotes, copies in any objects borrowed from another repo (`clone --shared` or `--reference`) so the copy doesn't depend on it, keeps your git identity (including one set by `includeIf "gitdir:..."`), and switches to the branch.
+4. **Rewrites leftover paths.** Untracked text files that contain the original folder's path get the copy's path instead: Python venv scripts (otherwise `pip` installs into the original's venv), pnpm shims, git hooks, absolute symlinks. Only the path of the repo itself is replaced: a sibling folder like `app data` next to `app` is left alone. Committed files are never changed, only listed, including committed symlinks and files in submodules. Binary files are skipped. Pid and lock files left by processes running in the original are removed.
 5. **Runs `.wb/setup`** if the repo has one.
+
+Until the copy is done, `wb ls` shows it as `creating` and other commands refuse it. If `wb new` is interrupted, `wb rm <name> --force` cleans up.
 
 ## `.wb/setup`
 
@@ -89,9 +91,11 @@ It refuses when deleting would lose:
 - commits the original can't reach and no remote has: on a branch or tag, in the stash, or only in the reflog after a detached HEAD or a reset
 - any of the above inside a submodule
 
-If git can't answer, it refuses too. `wb land` or push, then `rm` again; `--force` deletes anyway.
+A commit only counts as pushed if the remote has it now: when that matters, `rm` fetches from the remotes first, and refuses if it can't reach them. If git can't answer, it refuses too. `wb land` or push, then `rm` again; `--force` deletes anyway.
 
-Before deleting, it stops the processes running inside the copy. Shells are left alone, so a terminal tab that `cd`'d into it stays open. The folder is moved to `~/.workbenches/.trash` and deleted in the background, so `rm` returns at once.
+It stops the processes running inside the copy, then checks again, because a process can save files as it shuts down. Shells are left alone, so a terminal tab that `cd`'d into it stays open.
+
+The deleted copy is moved to `~/.workbenches/.trash` and kept for a day, in case a check got it wrong. Move it back out to recover it; it's a normal git repo.
 
 ## Speed
 

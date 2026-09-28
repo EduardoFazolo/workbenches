@@ -400,7 +400,7 @@ fn a_relative_remote_still_works_in_the_copy() {
 }
 
 #[test]
-fn relative_alternates_still_work_in_the_copy() {
+fn a_copy_of_a_shared_clone_owns_its_objects() {
     let env = Env::new();
     let base = env.repo("base");
     env.git(&env.root, &["clone", "-q", "--shared", base.to_str().unwrap(), "app"]);
@@ -414,6 +414,11 @@ fn relative_alternates_still_work_in_the_copy() {
     assert!(log.ok() && log.stdout.trim() == "initial", "the copy can't read its objects\n{log}");
     let fsck = env.try_git(&wb, &["fsck", "--connectivity-only"]);
     assert!(fsck.ok(), "{fsck}");
+
+    // "Independent": the copy keeps working after the repo it borrowed from moves.
+    fs::rename(&base, env.root.join("moved-base")).unwrap();
+    let log = env.try_git(&wb, &["log", "-1", "--format=%s"]);
+    assert!(log.ok(), "the copy still depends on the donor repo\n{log}");
 }
 
 #[test]
@@ -581,6 +586,23 @@ fn committed_absolute_symlinks_are_left_alone() {
 }
 
 #[test]
+fn a_sibling_folder_whose_name_starts_like_the_repo_is_left_alone() {
+    let env = Env::new();
+    let repo = env.repo("app");
+    env.commit(&repo, ".gitignore", "local.conf\nsibling-link\n", "ignore");
+    let sibling = env.dir("app data");
+    let conf = format!("data={}\ncode={}/src\n", sibling.display(), repo.display());
+    write(&repo.join("local.conf"), &conf);
+    symlink(&sibling, repo.join("sibling-link")).unwrap();
+
+    let wb = env.new_workbench(&repo, "feat");
+
+    let expected = format!("data={}\ncode={}/src\n", sibling.display(), wb.display());
+    assert_eq!(read(&wb.join("local.conf")), expected, "only the path to the repo itself is rewritten");
+    assert_eq!(fs::read_link(wb.join("sibling-link")).unwrap(), sibling);
+}
+
+#[test]
 fn committed_files_in_submodules_and_nested_repos_are_left_alone() {
     let env = Env::new();
     let app_path = env.root.join("app");
@@ -706,7 +728,7 @@ fn env_prints_every_documented_variable_as_evalable_exports() {
     let port: u32 = v[0].parse().expect("PORT is a number");
     assert_eq!(v[1], v[0]);
     assert_eq!(v[2], format!("{}-{}", port, port + 9));
-    assert_eq!(v[3], "app-feat");
+    assert!(v[3].starts_with("app-feat-"), "compose name is readable: {}", v[3]);
     assert_eq!(v[4], "feat");
     assert_eq!(v[5], "app");
     assert_eq!(v[6], wb.display().to_string());
@@ -786,11 +808,11 @@ fn shell_opens_a_shell_inside_the_workbench_with_its_env() {
 }
 
 #[test]
-fn compose_project_name_is_project_dash_name_and_always_valid_for_compose() {
+fn compose_project_name_is_readable_and_always_valid_for_compose() {
     let env = Env::new();
     let app = env.repo("app");
     env.new_workbench(&app, "login-fix");
-    assert_eq!(env.env_of(&app, "login-fix")["COMPOSE_PROJECT_NAME"], "app-login-fix");
+    assert!(env.env_of(&app, "login-fix")["COMPOSE_PROJECT_NAME"].starts_with("app-login-fix-"));
 
     // Compose only accepts lowercase letters, digits, '-' and '_', starting with a letter or digit.
     let mixed = env.repo("MyApp");
@@ -799,6 +821,17 @@ fn compose_project_name_is_project_dash_name_and_always_valid_for_compose() {
     let valid = name.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
         && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
     assert!(valid && name.starts_with("myapp-login-fix"), "not a valid, recognizable compose name: {name}");
+}
+
+#[test]
+fn compose_names_differ_when_project_and_name_split_differently() {
+    let env = Env::new();
+    let ab = env.repo("a-b");
+    let a = env.repo("a");
+    env.new_workbench(&ab, "c");
+    env.new_workbench(&a, "b-c");
+
+    assert_ne!(env.env_of(&ab, "c")["COMPOSE_PROJECT_NAME"], env.env_of(&a, "b-c")["COMPOSE_PROJECT_NAME"]);
 }
 
 #[test]
@@ -1304,6 +1337,64 @@ fn rm_allows_after_landing() {
     env.wb(&["rm", "feat"]).in_dir(&repo).succeeds();
 
     assert!(!wb.exists());
+}
+
+#[test]
+fn rm_refuses_when_the_remote_no_longer_has_the_pushed_commits() {
+    let env = Env::new();
+    let repo = env.repo("app");
+    let remote = env.remote(&repo, "origin", "remote");
+    let wb = env.new_workbench(&repo, "feat");
+    let sha = env.commit(&wb, "unique.txt", "unique work\n", "unique");
+    env.git(&wb, &["push", "-q", "origin", "feat"]);
+    // Someone deletes the branch on the remote and it gets garbage-collected.
+    env.git(&remote, &["update-ref", "-d", "refs/heads/feat"]);
+    env.git(&remote, &["reflog", "expire", "--expire=now", "--all"]);
+    env.git(&remote, &["gc", "-q", "--prune=now"]);
+    assert!(!env.try_git(&remote, &["cat-file", "-e", &sha]).ok());
+
+    env.wb(&["rm", "feat"]).in_dir(&repo).fails();
+
+    assert!(wb.exists(), "the only copy of the commit was deleted");
+}
+
+#[test]
+fn rm_refuses_when_a_process_writes_files_while_shutting_down() {
+    let env = Env::new();
+    let repo = env.repo("app");
+    let wb = env.new_workbench(&repo, "feat");
+    let ready = env.root.join("ready");
+    // A process that saves work to a tracked file when asked to stop.
+    let script = "import signal, sys, time, pathlib\n\
+def stop(*_):\n    pathlib.Path('README.md').write_text('saved on shutdown')\n    sys.exit(0)\n\
+signal.signal(signal.SIGTERM, stop)\npathlib.Path(sys.argv[1]).touch()\nwhile True: time.sleep(0.05)\n";
+    let mut child =
+        env.command("python3").args(["-c", script, ready.to_str().unwrap()]).current_dir(&wb).spawn().unwrap();
+    assert!(eventually(5, || ready.exists()));
+
+    let out = env.wb(&["rm", "feat"]).in_dir(&repo).fails();
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(wb.exists(), "deleted what the process saved\n{out}");
+    assert_eq!(read(&wb.join("README.md")), "saved on shutdown");
+}
+
+#[test]
+fn rm_keeps_the_deleted_copy_for_a_day() {
+    let env = Env::new();
+    let repo = env.repo("app");
+    let wb = env.new_workbench(&repo, "feat");
+    write(&wb.join("scratch.txt"), "notes\n");
+
+    let out = env.wb(&["rm", "feat", "--force"]).in_dir(&repo).succeeds();
+
+    assert!(!wb.exists());
+    assert!(out.mentions("a day"), "rm says where the copy went\n{out}");
+    std::thread::sleep(Duration::from_millis(500)); // give the background purge its chance
+    let kept: Vec<_> = fs::read_dir(env.wb_home.join(".trash")).unwrap().flatten().collect();
+    assert_eq!(kept.len(), 1, "the deleted copy is kept");
+    assert_eq!(read(&kept[0].path().join("scratch.txt")), "notes\n");
 }
 
 #[test]
