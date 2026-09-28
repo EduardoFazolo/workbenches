@@ -65,7 +65,7 @@ Settings: `WB_HOME` moves the copies (default `~/.workbenches`; keep it on the s
 
 1. **Refuses sources a copy can't be independent from.** A linked worktree or submodule, a repo that borrows objects from another (`clone --shared`), one in the middle of a merge, rebase, cherry-pick or bisect, or one with a git command running.
 2. **Copies the folder.** One `clonefile` call on macOS, a reflink per file on Linux. On a disk without clones it refuses rather than silently using gigabytes; `--copy` does a real copy.
-3. **Makes the copied `.git` its own.** Drops the original's worktree list and stale lock files, fixes relative remotes, keeps your git identity (including one set by `includeIf "gitdir:..."`), and switches to the branch.
+3. **Makes the copied `.git` its own.** Drops the original's worktree list and stale lock files, fixes relative remotes, keeps your git identity (including one set by `includeIf "gitdir:..."`), and switches to the branch. Your repo's git hooks don't run during these steps (a copied hook can still point at the original); run anything a hook would do, like a post-checkout step, from `.wb/setup`.
 4. **Fixes paths in three known places.** Some tools write the repo's absolute path into files they generate, and a copy of those would run or write into the original. `wb` rewrites the original's path to the copy's in:
    - Python virtualenvs: `pyvenv.cfg`, the scripts in `bin/`, `.pth` files (otherwise `pip` installs into the original's venv)
    - `node_modules/.bin` (package manager shims)

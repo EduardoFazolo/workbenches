@@ -139,6 +139,18 @@ fn new_checks_out_a_remote_only_branch_tracking_it() {
 }
 
 #[test]
+fn a_remote_branch_with_a_longer_name_does_not_block_a_new_branch() {
+    let env = Env::new();
+    let repo = env.repo("app");
+    env.remote(&repo, "origin", "remote");
+    env.git(&repo, &["push", "-q", "origin", "HEAD:refs/heads/team/feat"]);
+
+    let wb = env.new_workbench(&repo, "feat");
+
+    assert_eq!(env.branch(&wb), "feat");
+}
+
+#[test]
 fn the_same_branch_can_be_checked_out_in_several_workbenches() {
     let env = Env::new();
     let repo = env.repo("app");
@@ -344,6 +356,25 @@ fn the_original_repo_is_never_written_to() {
     env.wb(&["rm", "feat"]).in_dir(&repo).succeeds();
 
     assert_eq!(snapshot(&repo), before, "the original repo changed");
+}
+
+#[test]
+fn the_repos_git_hooks_do_not_run_while_wb_prepares_the_copy() {
+    let env = Env::new();
+    let repo = env.repo("app");
+    let marker = repo.join("hook-ran");
+    write_executable(
+        &repo.join(".git/hooks/post-checkout"),
+        &format!("#!/bin/sh\nprintf ran > '{}'\n", marker.display()),
+    );
+
+    let wb = env.new_workbench(&repo, "feat");
+
+    assert!(!marker.exists(), "a copied hook wrote into the original during wb new");
+    // Hooks still work normally when you use git in the copy.
+    env.git(&wb, &["switch", "-q", "-c", "other"]);
+    assert!(wb.join("hook-ran").exists(), "hooks run for your own git commands, pointed at the copy");
+    assert!(!marker.exists());
 }
 
 #[test]

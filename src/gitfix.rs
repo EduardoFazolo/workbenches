@@ -35,9 +35,12 @@ const IDENTITY: &[&str] = &[
     "credential.helper",
 ];
 
+/// git for wb's own bookkeeping. The repo's hooks are off: they're the repo's
+/// code, and a copied hook can still point at the original until paths are
+/// fixed. Hooks run as usual when you use git yourself.
 pub fn git(dir: &Path) -> Command {
     let mut c = Command::new("git");
-    c.arg("-C").arg(dir).stdin(Stdio::null());
+    c.arg("-C").arg(dir).args(["-c", "core.hooksPath=/dev/null"]).stdin(Stdio::null());
     for v in GIT_ENV {
         c.env_remove(v);
     }
@@ -183,8 +186,9 @@ pub fn fix_clone(src_repo: &Path, dst_repo: &Path, branch: &str) -> Result<Vec<S
     // switch` does it; anything else is created from HEAD.
     let current = out(dst_repo, &["branch", "--show-current"]).unwrap_or_default();
     if current != branch {
-        let exists = out(dst_repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_some()
-            || !run(dst_repo, &["branch", "-r", "--list", &format!("*/{branch}")])?.is_empty();
+        let has = |r: &str| out(dst_repo, &["rev-parse", "--verify", "--quiet", r]).is_some();
+        let exists = has(&format!("refs/heads/{branch}"))
+            || run(dst_repo, &["remote"])?.lines().any(|remote| has(&format!("refs/remotes/{remote}/{branch}")));
         let args: &[&str] = if exists { &["switch", "-q", branch] } else { &["switch", "-q", "-c", branch] };
         run(dst_repo, args).with_context(|| format!("switching the copy to branch '{branch}'"))?;
     }

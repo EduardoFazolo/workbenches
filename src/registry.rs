@@ -139,6 +139,27 @@ pub fn save(b: &Bench, create_new: bool) -> Result<()> {
 
 pub fn delete(b: &Bench) -> Result<()> {
     let _lock = lock()?;
+    remove_record(b)
+}
+
+/// Undoes a `wb new` that failed partway: runs `undo` and removes the record,
+/// but only if the record is still this same unfinished creation. Meanwhile
+/// `wb rm` may have removed it and someone may have made a new workbench with
+/// the same name, which must not be touched.
+pub fn abandon(b: &Bench, undo: impl FnOnce() -> Result<()>) -> Result<()> {
+    let _lock = lock()?;
+    let ours = fs::read(meta_path(&b.project, &b.name))
+        .ok()
+        .and_then(|d| serde_json::from_slice::<Bench>(&d).ok())
+        .is_some_and(|on_disk| on_disk.creating && on_disk.created == b.created && on_disk.port == b.port);
+    if ours {
+        undo()?;
+        remove_record(b)?;
+    }
+    Ok(())
+}
+
+fn remove_record(b: &Bench) -> Result<()> {
     let meta = meta_path(&b.project, &b.name);
     match fs::remove_file(&meta) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {

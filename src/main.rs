@@ -222,8 +222,8 @@ fn cmd_new(name: &str, branch: Option<String>, from: Option<PathBuf>, allow_copy
     };
 
     if let Err(e) = build(&bench, allow_copy) {
-        let _ = remove_dir_all::remove_dir_all(&bench.path);
-        let _ = registry::delete(&bench);
+        // The half-made copy goes to the trash like any other, never deleted.
+        let _ = registry::abandon(&bench, || if bench.path.exists() { trash(&bench).map(|_| ()) } else { Ok(()) });
         return Err(e);
     }
     let bench = Bench { creating: false, ..bench };
