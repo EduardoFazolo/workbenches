@@ -1,0 +1,38 @@
+[package]
+name = "workbenches"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Instant, independent copies of a git repo, each on its own branch and ports"
+license = "MIT"
+readme = "README.md"
+keywords = ["git", "worktree", "copy-on-write", "cli", "agents"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "wb"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+filetime = "0.2.29"
+memchr = "2.8.3"
+rayon = "1.12.0"
+reflink-copy = "0.1.30"
+remove_dir_all = "1.0.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sysinfo = "0.38.4"
+walkdir = "2.5.0"
+
+[target."cfg(unix)".dependencies]
+libc = "0.2.189"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
