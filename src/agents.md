@@ -82,7 +82,7 @@ wb ls                                 # STATUS should say: serving :<port>
 - **Scripts with a hardcoded port** (`next dev -p 3000`): don't edit tracked config just for this. Call the underlying command with `$PORT` instead: `wb run <name> -- sh -c 'npx next dev -p $PORT'`.
 - **Quoting matters.** `wb run x -- npx vite --port $PORT` passes YOUR shell's `$PORT`, which is usually empty or wrong. Use `sh -c '...'` with single quotes.
 - **Never test against `localhost:3000`** or any port outside your block. That's the user's main server or another agent's.
-- **Stopping:** stop your server when you're done. Kill the pid you started; a dev server can leave a child process holding the port, so check with `lsof -ti :$PORT` and kill what's left.
+- **Stopping:** stop your server when you're done. A dev server can leave children behind holding the port; "Removing a workbench" shows how to find them.
 
 ## Things a workbench does NOT isolate
 
@@ -126,13 +126,20 @@ Files, git state and ports are isolated. External services are **shared** unless
 
 ## Removing a workbench
 
-`wb` has no remove command: a workbench is removed by deleting its folder, and that's permanent. Only you know which changes are real work in this project, so check before you delete:
+`wb` has no remove command: a workbench is removed by deleting its folder, and that's permanent. Only you know which changes are real work in this project, so check before you delete. All of this runs inside the workbench (`cd "$(wb path <name>)"`):
 
-1. `git status` in the workbench. Commit real work. Changes a tool made on its own (a dev server rewriting `AGENTS.md`, a regenerated lockfile, build output) can go; say which in your report.
-2. `git push` the branch, or `wb land <name>`. If you pushed, `git log origin/<branch>..<branch>` should print nothing. Check `git stash list` too.
-3. Unsure whether something matters? Ask the user before deleting.
-4. Stop every process you started in it. Check its ports are free: `lsof -ti :$PORT` prints nothing.
-5. `rm -rf "$(wb path <name>)"`. `wb ls` stops listing it, and its name and ports are free again.
+1. **Uncommitted files:** `git status --short`. Commit real work. Changes a tool made on its own (a dev server rewriting `AGENTS.md`, a regenerated lockfile, build output) can go; say which in your report. `wb ls` saying `clean` only means this list is empty.
+2. **Commits no remote has:** `git log --oneline HEAD --not --remotes`. Push them, or `wb land <name>`. If you landed them, they're safe even though this still lists them.
+3. **Stashes:** `git stash list --format='%gd %cr: %s'`. The copy starts with every stash the original had, so a long list is normal. Only entries younger than the workbench (its AGE in `wb ls`) were made here.
+4. **Unsure whether something matters?** Ask the user before deleting.
+5. **Stop what runs from it.** Look both ways, then kill only processes you started (never your own shell):
+   ```sh
+   D="$(wb path <name>)"
+   lsof -d cwd 2>/dev/null | grep -F "$D"          # working directory inside it: npm run dev, servers
+   ps -eo pid,args | grep -F "$D" | grep -v grep   # its path in the command line: detached helpers
+   ```
+   Dev servers leave children behind (Next.js telemetry, watchers), so check again after killing, and check each port you used is free: `lsof -ti :$PORT` prints nothing.
+6. **Delete it:** `rm -rf "$(wb path <name>)"`. `wb ls` stops listing it, and its name and ports are free again.
 
 ## Landing
 

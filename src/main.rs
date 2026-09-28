@@ -64,7 +64,7 @@ Examples:
         no_setup: bool,
     },
 
-    /// List this repo's workbenches: branch, port, what's serving, changes
+    /// List this repo's workbenches: branch, port, what's serving, uncommitted files
     Ls {
         /// Every repo's workbenches
         #[arg(short, long)]

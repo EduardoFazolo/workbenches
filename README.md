@@ -90,13 +90,25 @@ If it fails, the copy is kept and `wb new` tells you how to re-run it. `--no-set
 
 ## Removing a workbench
 
-`wb` doesn't remove workbenches: you delete the folder. Which changes are work and which are noise depends on the project, so that call stays with you (or your agent):
+`wb` doesn't remove workbenches: you delete the folder, and that's permanent. Which changes are work and which are noise depends on the project, so that call stays with you (or your agent). Inside the workbench:
 
-1. Save what matters: `git status` in the workbench, commit, then push or `wb land`.
-2. Stop the servers you started in it, so their ports free up.
-3. `rm -rf "$(wb path <name>)"`
+```sh
+git status --short                          # uncommitted files: commit or discard
+git log --oneline HEAD --not --remotes      # commits no remote has: push or wb land
+git stash list --format='%gd %cr: %s'       # only entries younger than the workbench are new
+```
 
-Once the folder is gone, the workbench is gone: `wb ls` stops listing it, and its name and ports can be used again.
+The copy starts with every stash the original had, so a long stash list is normal. `wb ls` saying `clean` only means no uncommitted files.
+
+Then stop what runs from it. Servers leave children behind, so look for both kinds:
+
+```sh
+D="$(wb path login-fix)"
+lsof -d cwd 2>/dev/null | grep -F "$D"          # started inside it
+ps -eo pid,args | grep -F "$D" | grep -v grep   # its path in their command line
+```
+
+Kill the ones you started, then `rm -rf "$D"`. Once the folder is gone, `wb ls` stops listing it, and its name and ports can be used again.
 
 ## Speed
 
