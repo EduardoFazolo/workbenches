@@ -9,6 +9,7 @@ use common::*;
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
+use std::process::Stdio;
 
 // ───────────────────────── Making a workbench ─────────────────────────
 
@@ -1154,7 +1155,80 @@ fn new_refuses_a_full_copy_on_a_disk_without_copy_on_write_unless_asked() {
     assert_eq!(env.branch(&env.path_of(&repo, "feat")), "feat");
 }
 
-// ───────────────────────── wb rm ─────────────────────────
+// ───────────────────────── Removing a workbench ─────────────────────────
+
+#[test]
+fn check_on_an_untouched_workbench_is_clear_and_gives_the_delete_command() {
+    let env = Env::new();
+    let repo = env.repo("app");
+    write(&repo.join("README.md"), "stashed in the original\n");
+    env.git(&repo, &["stash", "-q"]);
+    let wb = env.new_workbench(&repo, "feat");
+
+    let out = env.wb(&["check", "feat"]).in_dir(&repo).succeeds();
+
+    assert!(out.mentions("copied"), "stashes copied from the original aren't new\n{out}");
+    assert!(out.mentions("rm -rf"), "{out}");
+    assert!(wb.exists(), "check never deletes");
+}
+
+#[test]
+fn check_lists_unsaved_work_and_exits_nonzero() {
+    let env = Env::new();
+    let repo = env.repo("app");
+    let wb = env.new_workbench(&repo, "feat");
+    env.commit(&wb, "work.txt", "never pushed\n", "work");
+    write(&wb.join("README.md"), "stash me\n");
+    env.git(&wb, &["stash", "-q"]);
+    write(&wb.join("notes.txt"), "uncommitted\n");
+
+    let out = env.wb(&["check", "feat"]).in_dir(&repo).fails();
+
+    assert!(out.mentions("notes.txt"), "names the uncommitted file\n{out}");
+    assert!(out.mentions("1 commit"), "{out}");
+    assert!(out.mentions("1 new"), "the stash made in the workbench\n{out}");
+    assert!(!out.mentions("rm -rf"), "no delete command while work would be lost\n{out}");
+}
+
+#[test]
+fn check_finds_processes_started_in_it_and_helpers_naming_it() {
+    let env = Env::new();
+    let repo = env.repo("app");
+    let wb = env.new_workbench(&repo, "feat");
+    let mut guard = Cleanup::new();
+    // Started inside it, like `npm run dev`.
+    let quiet = |mut c: std::process::Command| c.stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let mut inside = env.command("sleep");
+    inside.arg("300").current_dir(&wb);
+    guard.children.push(quiet(inside));
+    // Started elsewhere with its path in the command line, like a detached telemetry flush.
+    let mut helper = env.command("python3");
+    helper.args(["-c", "import time; time.sleep(300)", &format!("{}/flush.js", wb.display())]);
+    guard.children.push(quiet(helper));
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let out = env.wb(&["check", "feat"]).in_dir(&repo).fails();
+
+    for child in &guard.children {
+        assert!(out.stdout.contains(&child.id().to_string()), "pid {} not listed\n{out}", child.id());
+    }
+    for child in &mut guard.children {
+        assert!(!exited(child), "check never kills anything");
+    }
+}
+
+#[test]
+fn check_counts_landed_commits_as_saved() {
+    let env = Env::new();
+    let repo = env.repo("app");
+    let wb = env.new_workbench(&repo, "feat");
+    env.commit(&wb, "work.txt", "landed, not pushed\n", "work");
+    env.wb(&["land", "feat"]).in_dir(&repo).succeeds();
+
+    let out = env.wb(&["check", "feat"]).in_dir(&repo).succeeds();
+
+    assert!(out.mentions("landed"), "{out}");
+}
 
 #[test]
 fn deleting_a_workbench_folder_removes_it_and_frees_its_name_and_ports() {
@@ -1209,6 +1283,8 @@ fn two_workbenches_serve_next_to_the_original_on_their_own_ports() {
     let ls = env.wb(&["ls"]).in_dir(&repo).succeeds();
     assert!(ls.stdout.contains(&format!("serving :{pa}")), "{ls}");
     assert!(ls.stdout.contains(&format!("serving :{pb}")), "{ls}");
+    let check = env.wb(&["check", "a"]).in_dir(&repo).fails();
+    assert!(check.mentions(&format!("{pa} in use")), "check reports the busy port\n{check}");
 }
 
 // ───────────────────────── Things disappearing ─────────────────────────

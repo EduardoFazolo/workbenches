@@ -1,3 +1,4 @@
+mod check;
 mod clone;
 mod gitfix;
 mod registry;
@@ -24,6 +25,7 @@ Typical flow:
   wb new login-fix                   copy this repo; branch login-fix; ports 3100-3109
   wb run login-fix -- npm run dev    run it with PORT=3100
   wb land login-fix                  bring its commits back into this repo
+  wb check login-fix                 what deleting it would lose or leave running
   rm -rf \"$(wb path login-fix)\"      delete it when you're done (stop its servers first)
 
 Environment: WB_HOME (where copies live, default ~/.workbenches), WB_COPY=1 (same as --copy).
@@ -107,6 +109,17 @@ to put $PORT in its arguments.")]
         name: String,
     },
 
+    /// Report what deleting a workbench would lose or leave running; changes nothing
+    #[command(after_help = "\
+Checks uncommitted files, commits no remote or the original has, stashes made
+in the workbench (not the ones copied from the original), processes running
+from it, and its ports. Exits 0 when all are clear and prints the command to
+delete it; exits 1 otherwise. Deleting is up to you.")]
+    Check {
+        #[arg(help = NAME_HELP)]
+        name: String,
+    },
+
     /// Fetch a workbench's current branch into the original repo
     Land {
         #[arg(help = NAME_HELP)]
@@ -135,6 +148,7 @@ fn main() -> ExitCode {
         Cmd::Shell { name } => return cmd_shell(&name),
         Cmd::Env { name } => cmd_env(&name),
         Cmd::Land { name } => cmd_land(&name),
+        Cmd::Check { name } => return cmd_check(&name),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,
@@ -486,6 +500,20 @@ fn cmd_shell(name: &str) -> ExitCode {
     let mut c = Command::new(&shell);
     c.current_dir(&b.path).envs(b.env());
     hand_over(c, &shell)
+}
+
+fn cmd_check(name: &str) -> ExitCode {
+    match resolve_ready(name) {
+        Ok(b) if check::report(&b) => ExitCode::SUCCESS,
+        Ok(b) => {
+            eprintln!("wb: '{}' isn't clear to delete yet (see above)", b.name);
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("wb: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn cmd_env(name: &str) -> Result<()> {

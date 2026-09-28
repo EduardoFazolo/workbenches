@@ -28,7 +28,8 @@ wb run login-fix -- npm run dev   # run a command inside it with PORT=3100
 cd "$(wb path login-fix)"         # or work in it directly (wb shell login-fix opens a shell)
 wb ls                             # this repo's copies: branch, port, what's serving, changes
 wb land login-fix                 # fetch its branch into the original repo
-rm -rf "$(wb path login-fix)"     # delete it when you're done (stop its servers first)
+wb check login-fix                # what deleting it would lose or leave running
+rm -rf "$(wb path login-fix)"     # delete it when you're done
 ```
 
 `--branch <b>` checks out an existing branch instead of creating one, including a branch that only exists on a remote (like `git switch`). `--from <path>` copies a repo you're not in.
@@ -90,25 +91,27 @@ If it fails, the copy is kept and `wb new` tells you how to re-run it. `--no-set
 
 ## Removing a workbench
 
-`wb` doesn't remove workbenches: you delete the folder, and that's permanent. Which changes are work and which are noise depends on the project, so that call stays with you (or your agent). Inside the workbench:
+`wb` doesn't remove workbenches: you delete the folder, and that's permanent. Which changes are work and which are noise depends on the project, so that call stays with you (or your agent). `wb check` gathers the facts and changes nothing:
 
-```sh
-git status --short                          # uncommitted files: commit or discard
-git log --oneline HEAD --not --remotes      # commits no remote has: push or wb land
-git stash list --format='%gd %cr: %s'       # only entries younger than the workbench are new
+```
+$ wb check login-fix
+uncommitted   AGENTS.md
+unpushed      none
+stashes       none new (278 copied from the original)
+processes     2 running from it:
+                59592  node .../next/dist/telemetry/detached-flush.js
+                59601  next-server
+ports         3100 in use (block 3100-3109)
+→ deleting it now would lose the above or leave it running
 ```
 
-The copy starts with every stash the original had, so a long stash list is normal. `wb ls` saying `clean` only means no uncommitted files.
+- **uncommitted:** files git sees as changed, untracked included.
+- **unpushed:** commits only this branch has, that no remote or other branch has. Commits you `wb land`ed count as saved.
+- **stashes:** only ones made in the workbench. The copy starts with every stash the original had.
+- **processes:** started inside the folder, or with its path in their command line (servers leave detached helpers behind).
+- **ports:** the workbench's ports that something listens on.
 
-Then stop what runs from it. Servers leave children behind, so look for both kinds:
-
-```sh
-D="$(wb path login-fix)"
-lsof -d cwd 2>/dev/null | grep -F "$D"          # started inside it
-ps -eo pid,args | grep -F "$D" | grep -v grep   # its path in their command line
-```
-
-Kill the ones you started, then `rm -rf "$D"`. Once the folder is gone, `wb ls` stops listing it, and its name and ports can be used again.
+It exits 1 while anything is listed, and 0 once all is clear, when it prints the command to delete it. Save or discard what's listed, stop the processes, then `rm -rf "$(wb path login-fix)"`. Once the folder is gone, `wb ls` stops listing it and its name and ports can be used again.
 
 ## Speed
 
