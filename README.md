@@ -90,7 +90,14 @@ If it fails, the copy is kept and `wb new` tells you how to re-run it. `--no-set
 
 ## `wb rm`
 
-It stops the processes running inside the copy (shells are left alone, so a terminal tab `cd`'d into it stays open) and moves the copy to `~/.workbenches/.trash`, where it's kept for 3 days. To get it back, move the folder out; it's a normal git repo. If the copy can't be moved to the trash, nothing is deleted.
+It stops the processes running inside the copy (shells are left alone, so a terminal tab `cd`'d into it stays open) and moves the copy to `~/.workbenches/.trash`. If the copy can't be moved there, nothing is deleted.
+
+The trash:
+
+- **Nothing runs on a timer.** Each `wb rm` starts a background cleanup that deletes trashed copies older than 3 days.
+- **So 3 days is a minimum.** A copy stays until the first `wb rm` after it turns 3 days old. If you stop running `wb rm`, the trash never empties.
+- **To get a copy back,** move its folder out of the trash. It's a normal git repo.
+- **To empty it now,** delete what's in `~/.workbenches/.trash` yourself. That's safe.
 
 It doesn't decide whether your work is safe to remove: that depends on the project (a dev server that rewrites a file on every run isn't work). It lists what isn't saved anywhere else, by name: uncommitted files, stash entries, branches with commits no remote has. Before removing, commit what matters and push or `wb land` it; `wb rm --help` has the checklist.
 

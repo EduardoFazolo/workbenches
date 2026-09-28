@@ -134,7 +134,7 @@ Files, git state and ports are isolated. External services are **shared** unless
 3. Unsure whether something matters? Ask the user before removing.
 4. `wb rm <name>`. Read its output: it lists anything that wasn't saved elsewhere (uncommitted files, stash entries, unpushed branches). If it lists something you didn't expect, tell the user where the copy went.
 
-A removed copy stays in `~/.workbenches/.trash` for 3 days. To recover it, move its folder out of the trash; it's a normal git repo. If `wb rm` can't move the copy to the trash, it deletes nothing and says so.
+A removed copy stays in `~/.workbenches/.trash` for at least 3 days: each `wb rm` deletes trashed copies older than that, and nothing else does. To recover it, move its folder out of the trash; it's a normal git repo. If `wb rm` can't move the copy to the trash, it deletes nothing and says so.
 
 ## Landing
 
@@ -171,7 +171,7 @@ printf 'DATABASE_URL=postgres://localhost/myapp_%s\nPORT=%s\n' "$WB_NAME" "$WB_P
 - **`creating` in `wb ls`** means a `wb new` is still copying, or was interrupted. Other commands refuse that workbench until it's ready. If it stays that way, ask the user before `wb rm <name>`.
 - **`origin` and your git identity came along,** so `git push` and commits work normally.
 - **Copies live in `~/.workbenches/<project>/<name>`** (or `$WB_HOME`). Nothing is written into the original repo.
-- **`wb rm` returns at once.** It moves the folder to `~/.workbenches/.trash`, where it's kept for 3 days before being deleted in the background.
+- **`wb rm` returns at once.** It moves the folder to `~/.workbenches/.trash`. Later `wb rm` runs delete trashed copies older than 3 days.
 - **Installing packages in a workbench** (`npm install`, `pip install`) affects only that workbench.
 
 ## Install this guide as a skill
