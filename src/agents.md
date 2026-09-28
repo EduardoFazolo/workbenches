@@ -104,13 +104,12 @@ Files, git state and ports are isolated. External services are **shared** unless
     path    ~/.workbenches/myapp/fix-login
     branch  fix-login
     ports   3100-3109  (PORT=3100)
-    fixed   12 files/links that pointed at the original, removed 1 stale pid/lock/socket files
+    fixed   12 venv/shim/hook file(s) that pointed at the original
+    removed 1 pid/lock file(s) of servers running in the original
     note    kept your git identity from the original (user.email)
-  ! 1 committed file(s) mention the original folder's path and were left as-is: .vscode/settings.json
 ```
 
-- **`fixed`**: `wb` rewrote untracked files (venv scripts, shims, symlinks, hooks) that pointed at the original folder, so the workbench never runs or writes into the original. No action needed.
-- **`!` committed files mention the original path**: those tracked files still point at the original folder. If one matters for your task (for example a config path), be aware that it references `WB_SOURCE`. Don't "fix" it in a commit unless the task calls for it.
+- **`fixed`**: `wb` rewrote the original's path in Python venvs, `node_modules/.bin` and `.git/hooks`. It fixes only those. Any other file or symlink holding the original's absolute path (a config, an IDE setting) still points at `WB_SOURCE`: if one matters for your task, tell the user rather than editing a committed file.
 - **`.wb/setup failed`**: the workbench exists, but its setup script didn't complete. Read the error, fix it, then re-run with `wb run <name> -- sh .wb/setup`.
 
 ## When `wb new` refuses
@@ -119,6 +118,7 @@ Files, git state and ports are isolated. External services are **shared** unless
 |---|---|---|
 | linked worktree or submodule | You're in a git worktree or submodule; a copy would share its branch | Run from the main checkout, or use `--from <main repo path>` |
 | middle of a merge / rebase / cherry-pick / bisect | The repo has an operation in progress | Tell the user; don't finish or abort it on your own |
+| borrows objects from another repo | It was made with `clone --shared` or `--reference` | Tell the user; the message has the command that makes it self-contained |
 | a git command is running (index.lock) | Another git process is active, or crashed | Wait and retry. Delete `.git/index.lock` only if the user confirms nothing is running. |
 | can't make free copy-on-write copies ... would use X of real space | This disk has no copy-on-write | Ask the user before using `--copy` (it costs X of real disk) |
 | workbench 'x' already exists | The name is taken | Pick another name, or `wb ls` to see if it's yours to reuse |
@@ -127,7 +127,7 @@ Files, git state and ports are isolated. External services are **shared** unless
 
 ## When `wb rm` refuses
 
-It lists what would be lost: uncommitted changes (untracked files included), or commits the original repo can't reach and no remote has, whether on a branch, a tag, in the stash, or only in the reflog (after a detached HEAD or a reset). Submodules are checked too. A commit only counts as pushed if the remote has it right now, so `rm` may fetch first; if it can't reach a remote, or git fails, it refuses: report the error to the user. Deleted copies stay in `~/.workbenches/.trash` for a day.
+It lists what would be lost: uncommitted changes (untracked files included), or a branch, stash entry or detached HEAD with commits that neither the original nor a remote has. If git fails, it refuses: report the error to the user. Deleted copies stay in `~/.workbenches/.trash` for 3 days.
 
 1. Commit what matters inside the workbench.
 2. Then `wb land <name>` or `git push`.
@@ -170,7 +170,7 @@ printf 'DATABASE_URL=postgres://localhost/myapp_%s\nPORT=%s\n' "$WB_NAME" "$WB_P
 - **`creating` in `wb ls`** means a `wb new` is still copying, or was interrupted. Other commands refuse that workbench until it's ready. If it stays that way, ask the user before `wb rm <name> --force`.
 - **`origin` and your git identity came along,** so `git push` and commits work normally.
 - **Copies live in `~/.workbenches/<project>/<name>`** (or `$WB_HOME`). Nothing is written into the original repo.
-- **`wb rm` returns at once.** It moves the folder to `~/.workbenches/.trash`, where it's kept for a day before being deleted in the background.
+- **`wb rm` returns at once.** It moves the folder to `~/.workbenches/.trash`, where it's kept for 3 days before being deleted in the background.
 - **Installing packages in a workbench** (`npm install`, `pip install`) affects only that workbench.
 
 ## Install this guide as a skill

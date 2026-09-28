@@ -139,28 +139,6 @@ fn new_checks_out_a_remote_only_branch_tracking_it() {
 }
 
 #[test]
-fn new_prefers_origin_when_several_remotes_have_the_branch() {
-    let env = Env::new();
-    let repo = env.repo("app");
-    env.remote(&repo, "upstream", "upstream");
-    env.remote(&repo, "origin", "origin");
-    for (remote, content) in [("upstream", "from upstream\n"), ("origin", "from origin\n")] {
-        env.git(&repo, &["switch", "-qc", "shared", "main"]);
-        env.commit(&repo, "s.txt", content, remote);
-        env.git(&repo, &["push", "-q", remote, "shared"]);
-        env.git(&repo, &["switch", "-q", "main"]);
-        env.git(&repo, &["branch", "-qD", "shared"]);
-    }
-    let origin_tip = env.rev(&repo, "origin/shared");
-
-    env.wb(&["new", "s", "--branch", "shared"]).in_dir(&repo).succeeds();
-
-    let wb = env.path_of(&repo, "s");
-    assert_eq!(env.head(&wb), origin_tip);
-    assert_eq!(env.git(&wb, &["rev-parse", "--abbrev-ref", "shared@{upstream}"]), "origin/shared");
-}
-
-#[test]
 fn the_same_branch_can_be_checked_out_in_several_workbenches() {
     let env = Env::new();
     let repo = env.repo("app");
@@ -400,25 +378,16 @@ fn a_relative_remote_still_works_in_the_copy() {
 }
 
 #[test]
-fn a_copy_of_a_shared_clone_owns_its_objects() {
+fn new_refuses_a_repo_that_borrows_objects_from_another() {
     let env = Env::new();
     let base = env.repo("base");
     env.git(&env.root, &["clone", "-q", "--shared", base.to_str().unwrap(), "app"]);
     let repo = env.root.join("app");
-    write(&repo.join(".git/objects/info/alternates"), "../../../base/.git/objects\n");
-    env.git(&repo, &["log", "-1"]);
 
-    let wb = env.new_workbench(&repo, "feat");
+    let out = env.wb(&["new", "feat"]).in_dir(&repo).fails();
 
-    let log = env.try_git(&wb, &["log", "-1", "--format=%s"]);
-    assert!(log.ok() && log.stdout.trim() == "initial", "the copy can't read its objects\n{log}");
-    let fsck = env.try_git(&wb, &["fsck", "--connectivity-only"]);
-    assert!(fsck.ok(), "{fsck}");
-
-    // "Independent": the copy keeps working after the repo it borrowed from moves.
-    fs::rename(&base, env.root.join("moved-base")).unwrap();
-    let log = env.try_git(&wb, &["log", "-1", "--format=%s"]);
-    assert!(log.ok(), "the copy still depends on the donor repo\n{log}");
+    assert!(out.mentions("repack"), "the refusal says how to make the repo self-contained\n{out}");
+    env.wb(&["path", "feat"]).in_dir(&repo).fails();
 }
 
 #[test]
@@ -521,24 +490,6 @@ fn pnpm_style_shims_point_at_the_copy() {
 }
 
 #[test]
-fn absolute_symlinks_into_the_original_point_at_the_copy() {
-    let env = Env::new();
-    let repo = env.repo("app");
-    env.commit(&repo, ".gitignore", "links/\n", "ignore");
-    env.commit(&repo, "data/file.txt", "data\n", "data");
-    let outside = env.dir("outside").join("x.txt");
-    write(&outside, "outside\n");
-    fs::create_dir_all(repo.join("links")).unwrap();
-    symlink(repo.join("data/file.txt"), repo.join("links/inside")).unwrap();
-    symlink(&outside, repo.join("links/outside")).unwrap();
-
-    let wb = env.new_workbench(&repo, "feat");
-
-    assert_eq!(fs::read_link(wb.join("links/inside")).unwrap(), wb.join("data/file.txt"));
-    assert_eq!(fs::read_link(wb.join("links/outside")).unwrap(), outside, "links outside the repo are kept");
-}
-
-#[test]
 fn git_hooks_point_at_the_copy() {
     let env = Env::new();
     let repo = env.repo("app");
@@ -556,18 +507,16 @@ fn git_hooks_point_at_the_copy() {
 }
 
 #[test]
-fn committed_files_mentioning_the_original_are_left_alone_and_reported() {
+fn committed_files_mentioning_the_original_are_left_alone() {
     let env = Env::new();
     let repo = env.repo("app");
-    let content = format!("{{\"root\": \"{}\"}}\n", repo.display());
-    env.commit(&repo, ".vscode/settings.json", &content, "settings");
+    let line = format!("{{\"root\": \"{}/tools\"}}\n", repo.display());
+    env.commit(&repo, ".vscode/settings.json", &line, "settings");
 
-    let out = env.wb(&["new", "feat"]).in_dir(&repo).succeeds();
-    let wb = env.path_of(&repo, "feat");
+    let wb = env.new_workbench(&repo, "feat");
 
-    assert_eq!(read(&wb.join(".vscode/settings.json")), content);
+    assert_eq!(read(&wb.join(".vscode/settings.json")), line);
     assert_eq!(env.git(&wb, &["status", "--porcelain"]), "");
-    assert!(out.mentions(".vscode/settings.json"), "the committed file should be reported\n{out}");
 }
 
 #[test]
@@ -589,17 +538,16 @@ fn committed_absolute_symlinks_are_left_alone() {
 fn a_sibling_folder_whose_name_starts_like_the_repo_is_left_alone() {
     let env = Env::new();
     let repo = env.repo("app");
-    env.commit(&repo, ".gitignore", "local.conf\nsibling-link\n", "ignore");
+    env.commit(&repo, ".gitignore", ".venv/\n", "ignore venv");
     let sibling = env.dir("app data");
-    let conf = format!("data={}\ncode={}/src\n", sibling.display(), repo.display());
-    write(&repo.join("local.conf"), &conf);
-    symlink(&sibling, repo.join("sibling-link")).unwrap();
+    write(&repo.join(".venv/pyvenv.cfg"), "home = /usr/bin\n");
+    let script = format!("DATA={}\nCODE={}/src\n", sibling.display(), repo.display());
+    write_executable(&repo.join(".venv/bin/tool"), &script);
 
     let wb = env.new_workbench(&repo, "feat");
 
-    let expected = format!("data={}\ncode={}/src\n", sibling.display(), wb.display());
-    assert_eq!(read(&wb.join("local.conf")), expected, "only the path to the repo itself is rewritten");
-    assert_eq!(fs::read_link(wb.join("sibling-link")).unwrap(), sibling);
+    let expected = format!("DATA={}\nCODE={}/src\n", sibling.display(), wb.display());
+    assert_eq!(read(&wb.join(".venv/bin/tool")), expected, "only paths inside the repo are rewritten");
 }
 
 #[test]
@@ -1127,22 +1075,6 @@ fn land_refuses_a_detached_head_cleanly() {
     env.wb(&["land", "feat"]).in_dir(&repo).fails();
 }
 
-#[test]
-fn a_broken_nested_repo_is_left_as_copied_and_reported() {
-    let env = Env::new();
-    let repo = env.repo("app");
-    env.commit(&repo, ".gitignore", "vendor/\n", "ignore vendor");
-    let mention = format!("root = {}/vendor/lib\n", repo.display());
-    write(&repo.join("vendor/lib/.git"), "gitdir: /nonexistent/modules/lib\n");
-    write(&repo.join("vendor/lib/config.txt"), &mention);
-
-    let out = env.wb(&["new", "feat"]).in_dir(&repo).succeeds();
-
-    let wb = env.path_of(&repo, "feat");
-    assert_eq!(read(&wb.join("vendor/lib/config.txt")), mention, "files git can't vouch for aren't rewritten");
-    assert!(out.mentions("vendor/lib"), "the skipped repo is reported\n{out}");
-}
-
 #[cfg(target_os = "linux")]
 #[test]
 fn new_refuses_a_full_copy_on_a_disk_without_copy_on_write_unless_asked() {
@@ -1220,6 +1152,20 @@ fn rm_refuses_when_a_commit_exists_only_on_its_branch() {
 }
 
 #[test]
+fn rm_refuses_when_a_commit_exists_only_on_a_detached_head() {
+    let env = Env::new();
+    let repo = env.repo("app");
+    let wb = env.new_workbench(&repo, "feat");
+    env.git(&wb, &["switch", "-q", "--detach"]);
+    env.commit(&wb, "x.txt", "x\n", "detached work");
+
+    let out = env.wb(&["rm", "feat"]).in_dir(&repo).fails();
+
+    assert!(out.mentions("detached"), "{out}");
+    assert!(wb.exists());
+}
+
+#[test]
 fn rm_refuses_when_a_stash_would_be_lost() {
     let env = Env::new();
     let repo = env.repo("app");
@@ -1231,82 +1177,6 @@ fn rm_refuses_when_a_stash_would_be_lost() {
     let out = env.wb(&["rm", "feat"]).in_dir(&repo).fails();
 
     assert!(out.mentions("stash"), "{out}");
-    assert!(wb.exists());
-}
-
-#[test]
-fn rm_refuses_when_a_commit_exists_only_on_a_tag() {
-    let env = Env::new();
-    let repo = env.repo("app");
-    let wb = env.new_workbench(&repo, "feat");
-    env.git(&wb, &["switch", "-q", "--detach"]);
-    env.commit(&wb, "t.txt", "t\n", "tagged only");
-    env.git(&wb, &["tag", "v9"]);
-    env.git(&wb, &["switch", "-q", "feat"]);
-
-    let out = env.wb(&["rm", "feat"]).in_dir(&repo).fails();
-
-    assert!(out.mentions_any(&["v9", "tag"]), "{out}");
-    assert!(wb.exists());
-}
-
-#[test]
-fn rm_refuses_when_a_detached_head_commit_exists_only_in_the_reflog() {
-    let env = Env::new();
-    let repo = env.repo("app");
-    let wb = env.new_workbench(&repo, "feat");
-    env.git(&wb, &["switch", "-q", "--detach"]);
-    env.commit(&wb, "d.txt", "d\n", "made while detached");
-    env.git(&wb, &["switch", "-q", "feat"]);
-
-    env.wb(&["rm", "feat"]).in_dir(&repo).fails();
-
-    assert!(wb.exists());
-}
-
-#[test]
-fn rm_refuses_when_a_reset_commit_exists_only_in_the_reflog() {
-    let env = Env::new();
-    let repo = env.repo("app");
-    let wb = env.new_workbench(&repo, "feat");
-    env.commit(&wb, "r.txt", "r\n", "then reset away");
-    env.git(&wb, &["reset", "-q", "--hard", "HEAD~1"]);
-
-    env.wb(&["rm", "feat"]).in_dir(&repo).fails();
-
-    assert!(wb.exists());
-}
-
-#[test]
-fn rm_refuses_when_a_submodule_commit_was_never_pushed() {
-    let env = Env::new();
-    let (repo, _lib) = repo_with_submodule(&env);
-    env.remote(&repo, "origin", "remote");
-    let wb = env.new_workbench(&repo, "feat");
-    env.commit(&wb.join("lib"), "lib-change.txt", "x\n", "submodule work");
-    env.git(&wb, &["add", "lib"]);
-    env.git(&wb, &["commit", "-qm", "bump submodule"]);
-    // The superproject's commit is safe on its remote; only the submodule commit is at risk.
-    env.git(&wb, &["push", "-q", "--recurse-submodules=no", "-u", "origin", "feat"]);
-    assert_eq!(env.git(&wb, &["status", "--porcelain"]), "");
-
-    let out = env.wb(&["rm", "feat"]).in_dir(&repo).fails();
-
-    assert!(out.mentions("lib"), "should name the submodule\n{out}");
-    assert!(wb.join("lib/lib-change.txt").exists());
-}
-
-#[test]
-fn rm_refuses_when_landed_commits_were_deleted_from_the_original() {
-    let env = Env::new();
-    let repo = env.repo("app");
-    let wb = env.new_workbench(&repo, "feat");
-    env.commit(&wb, "a.txt", "a\n", "landed");
-    env.wb(&["land", "feat"]).in_dir(&repo).succeeds();
-    env.git(&repo, &["branch", "-qD", "feat"]);
-
-    env.wb(&["rm", "feat"]).in_dir(&repo).fails();
-
     assert!(wb.exists());
 }
 
@@ -1340,48 +1210,7 @@ fn rm_allows_after_landing() {
 }
 
 #[test]
-fn rm_refuses_when_the_remote_no_longer_has_the_pushed_commits() {
-    let env = Env::new();
-    let repo = env.repo("app");
-    let remote = env.remote(&repo, "origin", "remote");
-    let wb = env.new_workbench(&repo, "feat");
-    let sha = env.commit(&wb, "unique.txt", "unique work\n", "unique");
-    env.git(&wb, &["push", "-q", "origin", "feat"]);
-    // Someone deletes the branch on the remote and it gets garbage-collected.
-    env.git(&remote, &["update-ref", "-d", "refs/heads/feat"]);
-    env.git(&remote, &["reflog", "expire", "--expire=now", "--all"]);
-    env.git(&remote, &["gc", "-q", "--prune=now"]);
-    assert!(!env.try_git(&remote, &["cat-file", "-e", &sha]).ok());
-
-    env.wb(&["rm", "feat"]).in_dir(&repo).fails();
-
-    assert!(wb.exists(), "the only copy of the commit was deleted");
-}
-
-#[test]
-fn rm_refuses_when_a_process_writes_files_while_shutting_down() {
-    let env = Env::new();
-    let repo = env.repo("app");
-    let wb = env.new_workbench(&repo, "feat");
-    let ready = env.root.join("ready");
-    // A process that saves work to a tracked file when asked to stop.
-    let script = "import signal, sys, time, pathlib\n\
-def stop(*_):\n    pathlib.Path('README.md').write_text('saved on shutdown')\n    sys.exit(0)\n\
-signal.signal(signal.SIGTERM, stop)\npathlib.Path(sys.argv[1]).touch()\nwhile True: time.sleep(0.05)\n";
-    let mut child =
-        env.command("python3").args(["-c", script, ready.to_str().unwrap()]).current_dir(&wb).spawn().unwrap();
-    assert!(eventually(5, || ready.exists()));
-
-    let out = env.wb(&["rm", "feat"]).in_dir(&repo).fails();
-    let _ = child.kill();
-    let _ = child.wait();
-
-    assert!(wb.exists(), "deleted what the process saved\n{out}");
-    assert_eq!(read(&wb.join("README.md")), "saved on shutdown");
-}
-
-#[test]
-fn rm_keeps_the_deleted_copy_for_a_day() {
+fn rm_keeps_the_deleted_copy_for_three_days() {
     let env = Env::new();
     let repo = env.repo("app");
     let wb = env.new_workbench(&repo, "feat");
@@ -1390,7 +1219,7 @@ fn rm_keeps_the_deleted_copy_for_a_day() {
     let out = env.wb(&["rm", "feat", "--force"]).in_dir(&repo).succeeds();
 
     assert!(!wb.exists());
-    assert!(out.mentions("a day"), "rm says where the copy went\n{out}");
+    assert!(out.mentions("3 days"), "rm says where the copy went\n{out}");
     std::thread::sleep(Duration::from_millis(500)); // give the background purge its chance
     let kept: Vec<_> = fs::read_dir(env.wb_home.join(".trash")).unwrap().flatten().collect();
     assert_eq!(kept.len(), 1, "the deleted copy is kept");

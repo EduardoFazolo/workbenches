@@ -247,44 +247,17 @@ fn build(b: &Bench, allow_copy: bool) -> Result<()> {
     println!("    path    {}", tilde(&b.path));
     println!("    branch  {}", b.branch);
     println!("    ports   {}-{}  (PORT={})", b.port, b.port + PORT_BLOCK - 1, b.port);
-    let mut fixed = Vec::new();
-    if stats.files + stats.links > 0 {
-        fixed.push(format!("{} files/links that pointed at the original", stats.files + stats.links));
+    if stats.fixed > 0 {
+        println!("    fixed   {} venv/shim/hook file(s) that pointed at the original", stats.fixed);
     }
     if stats.removed > 0 {
-        fixed.push(format!("removed {} stale pid/lock/socket files", stats.removed));
-    }
-    if !fixed.is_empty() {
-        println!("    fixed   {}", fixed.join(", "));
+        println!("    removed {} pid/lock file(s) of servers running in the original", stats.removed);
     }
     for n in notes {
         println!("    note    {n}");
     }
-    if !stats.tracked_hits.is_empty() {
-        let shown: Vec<&str> = stats.tracked_hits.iter().take(5).map(String::as_str).collect();
-        let more = stats.tracked_hits.len().saturating_sub(5);
-        println!(
-            "  ! {} committed file(s) mention the original folder's path and were left as-is: {}{}",
-            stats.tracked_hits.len(),
-            shown.join(", "),
-            if more > 0 { format!(" (+{more} more)") } else { String::new() }
-        );
-    }
-    for repo in &stats.unlisted {
-        let shown = if repo.is_empty() { "." } else { repo.as_str() };
-        println!("  ! git couldn't list the committed files of {shown}, so nothing in it was rewritten");
-    }
-    if !stats.failed.is_empty() {
-        println!(
-            "  ! {} file(s) still point at the original and couldn't be fixed, so running them may touch it:",
-            stats.failed.len()
-        );
-        for f in stats.failed.iter().take(5) {
-            println!("      {f}");
-        }
-        if stats.failed.len() > 5 {
-            println!("      (+{} more)", stats.failed.len() - 5);
-        }
+    for f in &stats.failed {
+        println!("  ! couldn't fix {f}");
     }
     Ok(())
 }
@@ -480,9 +453,8 @@ fn cmd_ls(all: bool) -> Result<()> {
 fn cmd_rm(name: &str, force: bool) -> Result<()> {
     let b = resolve(name)?;
     if b.path.exists() {
-        // Check before stopping anything, so a refusal leaves running servers alone...
         if !force {
-            refuse_if_unsaved(&b, "")?;
+            refuse_if_unsaved(&b)?;
         }
         let dir = canonical(&b.path);
         let procs::Stopped { stopped, shells } = procs::stop_inside(&dir);
@@ -491,10 +463,6 @@ fn cmd_rm(name: &str, force: bool) -> Result<()> {
         }
         if shells > 0 {
             println!("  note: {shells} shell(s) had their working directory inside it; cd them elsewhere");
-        }
-        // ...and again after, because a process can write files as it shuts down.
-        if !force && stopped > 0 {
-            refuse_if_unsaved(&b, "its processes changed files while stopping. ")?;
         }
         // Best effort: background git helpers that would outlive the folder.
         let _ = gitfix::git(&b.path).args(["fsmonitor--daemon", "stop"]).output();
@@ -517,9 +485,10 @@ fn cmd_rm(name: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
-/// How long deleted workbenches stay in the trash: the safety checks can be
-/// wrong, and a day is enough to notice.
-const TRASH_KEEP_SECS: u64 = 24 * 60 * 60;
+/// How long deleted workbenches stay in the trash. The checks before deleting
+/// are deliberately simple; this is the real safety net. Three days covers a
+/// weekend.
+const TRASH_KEEP_SECS: u64 = 3 * 24 * 60 * 60;
 
 /// Deleting 100k files takes seconds; renaming the folder is instant. So move it
 /// into ~/.workbenches/.trash and let a detached `wb __purge` delete whatever
@@ -532,7 +501,7 @@ fn trash(b: &Bench) -> Result<()> {
         // e.g. Windows with a file still open: fall back to deleting in place.
         return remove_dir_all::remove_dir_all(&b.path).with_context(|| format!("deleting {}", b.path.display()));
     }
-    println!("  kept in {} for a day, in case you need it back", tilde(&dest));
+    println!("  kept in {} for 3 days, in case you need it back", tilde(&dest));
     if let Ok(exe) = std::env::current_exe() {
         let mut c = Command::new(exe);
         c.arg("__purge")
@@ -563,13 +532,13 @@ fn purge_trash() {
     }
 }
 
-fn refuse_if_unsaved(b: &Bench, why: &str) -> Result<()> {
-    let problems = unsaved_work(b).with_context(|| {
+fn refuse_if_unsaved(b: &Bench) -> Result<()> {
+    let problems = gitfix::unsaved_work(&b.path, &b.source).with_context(|| {
         format!("couldn't check '{}' for unsaved work, so it wasn't deleted (--force deletes anyway)", b.name)
     })?;
     if !problems.is_empty() {
         bail!(
-            "{why}'{}' has work that would be lost:\n  - {}\nLand it (wb land {}), push it, or delete anyway with: wb rm {} --force",
+            "'{}' has work that would be lost:\n  - {}\nLand it (wb land {}), push it, or delete anyway with: wb rm {} --force",
             b.name,
             problems.join("\n  - "),
             b.name,
@@ -577,17 +546,6 @@ fn refuse_if_unsaved(b: &Bench, why: &str) -> Result<()> {
         );
     }
     Ok(())
-}
-
-/// Everything `wb rm` would lose, in the workbench and its submodules.
-fn unsaved_work(b: &Bench) -> Result<Vec<String>> {
-    let mut problems = gitfix::unsaved_work(&b.path, &b.source, b.created)?;
-    for sub in gitfix::submodules(&b.path)? {
-        for p in gitfix::unsaved_work(&b.path.join(&sub), &b.source.join(&sub), b.created)? {
-            problems.push(format!("{}: {p}", sub.display()));
-        }
-    }
-    Ok(problems)
 }
 
 fn has_compose_file(dir: &Path) -> bool {

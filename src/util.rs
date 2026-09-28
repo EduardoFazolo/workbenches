@@ -24,12 +24,6 @@ fn strip_verbatim(p: PathBuf) -> PathBuf {
     p
 }
 
-/// Forward-slash relative path, used as a stable key across OSes.
-pub fn rel_key(root: &Path, p: &Path) -> Option<String> {
-    let rel = p.strip_prefix(root).ok()?;
-    Some(rel.to_string_lossy().replace('\\', "/"))
-}
-
 pub fn human_bytes(n: u64) -> String {
     let units = ["B", "KB", "MB", "GB", "TB"];
     let mut v = n as f64;
